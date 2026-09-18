@@ -1,8 +1,39 @@
 /target
 
-# Beads / Dolt files (added by bd init)
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.secret.*
+credentials.json
+service-account*.json
+*.pem
+*.key
+
+# Operating system and editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/*
+
+# Local worktree state; reusable .agents/skills/ content stays trackable
+.worktrees/
+
+# Local Dolt state; retain Beads' generated .beads/.gitignore
 .dolt/
+.beads/proxieddb/
+.beads/embeddeddolt/
+
+# Graphify output
+graphify-out/
+
+# Build caches and logs
+*.log
+tmp/
+
+# Beads / Dolt files (added by bd init)
 *.db
 .beads-credential-key
-.beads/proxieddb/
 *.gate.lock*
