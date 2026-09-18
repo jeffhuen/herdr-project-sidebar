@@ -5,6 +5,9 @@ description = "Orca-style project sidebar for Herdr: collapsible project -> work
 min_herdr_version = "0.9.0"
 platforms = ["linux", "macos"]
 
+[[build]]
+command = ["cargo", "build", "--release"]
+
 [[panes]]
 id = "projects"
 title = "Projects"
@@ -17,4 +20,11 @@ id = "open-projects"
 title = "Projects: open sidebar"
 description = "Open the project sidebar in a right split (focus it if already open)."
 command = ["bash", "scripts/open-projects.sh"]
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "toggle-projects"
+title = "Projects: toggle sidebar"
+description = "Close the project sidebar if focused in this tab, otherwise open/focus it."
+command = ["./target/release/herdr-project-sidebar", "--toggle"]
 platforms = ["linux", "macos"]
