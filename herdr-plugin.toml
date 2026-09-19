@@ -1,8 +1,8 @@
 id = "herdr-project-sidebar"
-name = "herdr-project-sidebar"
-version = "0.1.0"
-description = "Orca-style project sidebar for Herdr: collapsible project -> worktree -> agent tree."
-min_herdr_version = "0.9.0"
+name = "Projects"
+version = "0.2.0"
+description = "Project sidebar for Herdr: interactive terminal dock and native sidebar presentation."
+min_herdr_version = "0.9.1"
 platforms = ["linux", "macos"]
 
 [[build]]
@@ -12,19 +12,75 @@ command = ["cargo", "build", "--release"]
 id = "projects"
 title = "Projects"
 placement = "split"
-command = ["./target/release/herdr-project-sidebar"]
+command = ["./target/release/herdr-project-sidebar", "dock"]
 platforms = ["linux", "macos"]
 
 [[actions]]
 id = "open-projects"
-title = "Projects: open sidebar"
-description = "Open the project sidebar in a right split (focus it if already open)."
+title = "Projects: open dock"
+description = "Open the project sidebar dock in a split (focus it if already open)."
 command = ["bash", "scripts/open-projects.sh"]
 platforms = ["linux", "macos"]
 
 [[actions]]
 id = "toggle-projects"
-title = "Projects: toggle sidebar"
-description = "Close the project sidebar if focused in this tab, otherwise open/focus it."
+title = "Projects: toggle dock"
+description = "Close the project sidebar dock if focused in this tab, otherwise open/focus it."
 command = ["./target/release/herdr-project-sidebar", "--toggle"]
+platforms = ["linux", "macos"]
+
+[[panes]]
+id = "settings"
+title = "Projects settings"
+placement = "popup"
+width = 64
+height = 21
+command = ["./target/release/herdr-project-sidebar", "--settings-ui"]
+
+[[actions]]
+id = "settings"
+title = "Projects: settings"
+description = "Set dock width, startup visibility, grouping, details and icons."
+command = ["./target/release/herdr-project-sidebar", "--settings"]
+
+[[actions]]
+id = "toggle-style"
+title = "Projects: toggle standard / project styling"
+description = "Switch native rows and ordering without hiding the sidebar or changing focus."
+command = ["./target/release/herdr-project-sidebar", "--toggle-style"]
+
+[[actions]]
+id = "configure"
+title = "Projects: enable native sidebar"
+description = "Back up configuration, apply native rows and start the metadata publisher."
+command = ["./target/release/herdr-project-sidebar", "--configure"]
+
+[[actions]]
+id = "unconfigure"
+title = "Projects: restore previous configuration"
+description = "Restore the previous owned settings and clear Projects metadata."
+command = ["./target/release/herdr-project-sidebar", "--unconfigure"]
+
+[[actions]]
+id = "install-font"
+title = "Projects: install compact icons"
+description = "Install the optional compact icon font; terminal codepoint mapping is required."
+command = ["./target/release/herdr-project-sidebar", "--install-font"]
+
+[[startup]]
+command = ["./target/release/herdr-project-sidebar", "--start"]
+
+[[events]]
+on = "pane.focused"
+command = ["./target/release/herdr-project-sidebar", "--ensure"]
+platforms = ["linux", "macos"]
+
+[[events]]
+on = "tab.focused"
+command = ["./target/release/herdr-project-sidebar", "--ensure"]
+platforms = ["linux", "macos"]
+
+[[events]]
+on = "workspace.focused"
+command = ["./target/release/herdr-project-sidebar", "--ensure"]
 platforms = ["linux", "macos"]

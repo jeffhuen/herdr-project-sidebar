@@ -1,6 +1,6 @@
 # herdr-project-sidebar agent contract
 
-Rust + Ratatui docked pane for Herdr: collapsible `project -> worktree -> agent` tree, git-aware, event-driven.
+Rust metadata publisher for Herdr's native Agents and Spaces lists, with a transient Ratatui settings popup.
 
 ## Build and checks
 
@@ -13,13 +13,13 @@ Link the checkout for live verification (no install step, `plugin link` runs no 
 
 ```sh
 herdr plugin link /home/jeffhuen/projects/herdr-project-sidebar
-herdr plugin action invoke open-projects --plugin herdr-project-sidebar
+herdr plugin action invoke configure --plugin herdr-project-sidebar
 ```
 
 ## Constraints
 
-- Perf budget: deadline-driven tick (150ms only while a visible agent works, 1s idle sleep), signature-skipped draws, windowed render. No per-event process spawns.
-- Live Herdr sync plugs into `snapshot()`; keep its return shape stable so render does not change.
+- Perf budget: socket snapshot poll (300ms tick/snapshot floor, signature-skipped draws, windowed render) and delta-only metadata writes. No per-event process spawns.
+- Herdr owns navigation, visibility, selection, and agent lifecycle. Do not reintroduce a custom dock or duplicate lifecycle state.
 - Never subscribe to `pane.updated`: the echo pushes write latency from ~1ms to ~110ms (measured in herdr-radar recon).
 
 ## Shared procedures
