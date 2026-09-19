@@ -23,17 +23,30 @@ fn read_response(stream: impl Read, id: &str) -> io::Result<Value> {
     let mut line = String::new();
     BufReader::new(stream.take(LIMIT)).read_line(&mut line)?;
     if !line.ends_with('\n') {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated Herdr response"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated Herdr response",
+        ));
     }
     let response: Value = serde_json::from_str(&line)?;
     if response.get("id").and_then(Value::as_str) != Some(id) {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected Herdr response id"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unexpected Herdr response id",
+        ));
     }
     if let Some(error) = response.get("error") {
-        return Err(io::Error::other(error.get("message").and_then(Value::as_str)
-            .unwrap_or("Herdr request failed").to_owned()));
+        return Err(io::Error::other(
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Herdr request failed")
+                .to_owned(),
+        ));
     }
-    response.get("result").cloned()
+    response
+        .get("result")
+        .cloned()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing Herdr result"))
 }
 
@@ -47,10 +60,17 @@ pub fn branch_map(roots: &[String]) -> std::collections::BTreeMap<String, String
     let mut map = std::collections::BTreeMap::new();
     for root in roots {
         // Daemon rejects trailing-slash cwds; normalize the request.
-        let beans = call("worktree.list", json!({ "cwd": root.trim_end_matches('/') }));
+        let beans = call(
+            "worktree.list",
+            json!({ "cwd": root.trim_end_matches('/') }),
+        );
         let Ok(list) = beans else { continue };
         let empty = Vec::new();
-        for w in list.pointer("/worktrees").and_then(Value::as_array).unwrap_or(&empty) {
+        for w in list
+            .pointer("/worktrees")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty)
+        {
             let path = w.get("path").and_then(Value::as_str).unwrap_or("");
             let branch = w.get("branch").and_then(Value::as_str).unwrap_or("");
             if !path.is_empty() && !branch.is_empty() {

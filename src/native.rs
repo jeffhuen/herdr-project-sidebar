@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -13,68 +14,121 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Map, Value};
 
 use crate::activity::{now_unix_ms, ActivityStore, Freshness};
-use crate::{config, icons, ipc};
+use crate::{config, dock_control, icons, ipc};
 
 const SOURCE: &str = "plugin:herdr-project-sidebar";
-const SPIN_MS: u64 = 150;
-// Recovery bound, not change detection: semantic transitions arrive via the
-// event wake hints; this only bounds how stale an idle view can get.
-const CATCH_ALL: Duration = Duration::from_secs(10);
+const SPIN_MS: u64 = 300;
+const POLL_INTERVAL: Duration = Duration::from_millis(300);
+const CONTROL_LIMIT: u64 = 8192;
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const READY_ENV: &str = "HERDR_PROJECT_SIDEBAR_READY";
+const COMMAND_START_ENV: &str = "HERDR_PROJECT_SIDEBAR_COMMAND_START";
 
 const KEYS: [&str; 17] = [
-    "group_parent", "group", "group_stale", "split_mark",
-    "logo", "logo_working", "logo_stale", "harness_logo",
-    "title_working", "title_done", "title_blocked",
-    "title_idle_fresh", "title_idle", "title_idle_stale", "title_unknown",
-    "gap", "ws_group",
+    "group_parent",
+    "group",
+    "group_stale",
+    "split_mark",
+    "logo",
+    "logo_working",
+    "logo_stale",
+    "harness_logo",
+    "title_working",
+    "title_done",
+    "title_blocked",
+    "title_idle_fresh",
+    "title_idle",
+    "title_idle_stale",
+    "title_unknown",
+    "gap",
+    "ws_group",
 ];
 
-const SPACE_KEYS: [&str; 20] = [
-    "space_blocked", "space_done", "space_idle", "space_unknown", "space_none", "space_label",
-    "space_working_claude", "space_working_gemini", "space_working_kimi",
-    "space_working_deepseek", "space_working_qwen", "space_working_kiro",
-    "space_working_cline", "space_working_kilo", "space_working_other",
-    "space_logo_claude", "space_logo_gemini", "space_logo_kimi",
-    "space_logo_deepseek", "space_logo_qwen",
+const SPACE_KEYS: [&str; 18] = [
+    "space_blocked",
+    "space_done",
+    "space_idle",
+    "space_unknown",
+    "space_none",
+    "space_label",
+    "space_working_claude",
+    "space_working_gemini",
+    "space_working_kimi",
+    "space_working_qwen",
+    "space_working_kiro",
+    "space_working_cline",
+    "space_working_kilo",
+    "space_working_other",
+    "space_logo_claude",
+    "space_logo_gemini",
+    "space_logo_kimi",
+    "space_logo_qwen",
 ];
 
 type Tokens = Map<String, Value>;
 type RowTokens = BTreeMap<String, Tokens>;
 
 fn socket_path() -> io::Result<PathBuf> {
-    std::env::var_os("HERDR_SOCKET_PATH").map(PathBuf::from)
+    std::env::var_os("HERDR_SOCKET_PATH")
+        .map(PathBuf::from)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HERDR_SOCKET_PATH is not set"))
 }
 
 fn daemon_paths() -> io::Result<(PathBuf, PathBuf)> {
     let socket = socket_path()?;
     let socket = socket.canonicalize().unwrap_or(socket);
-    let hash = socket.as_os_str().as_bytes().iter().fold(0xcbf29ce484222325u64,
-        |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3));
+    let hash = socket
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
     let dir = config::state_dir();
-    fs::create_dir_all(&dir)?;
-    Ok((dir.join(format!("daemon-{hash:016x}.lock")), dir.join(format!("d-{hash:016x}.sock"))))
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    Ok((
+        dir.join(format!("daemon-{hash:016x}.lock")),
+        dir.join(format!("d-{hash:016x}.sock")),
+    ))
 }
 
 struct SocketFile(PathBuf);
 impl Drop for SocketFile {
-    fn drop(&mut self) { let _ = fs::remove_file(&self.0); }
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
 }
 
 pub fn start() -> io::Result<()> {
-    if !config::load()?.enabled { return clear(); }
+    start_inner(false)
+}
+
+fn start_inner(await_command: bool) -> io::Result<()> {
     let (_, ready) = daemon_paths()?;
-    if UnixStream::connect(&ready).is_ok() { return Ok(()); }
+    if UnixStream::connect(&ready).is_ok() {
+        return Ok(());
+    }
     let reply = config::state_dir().join(format!("r-{}.sock", std::process::id()));
     let listener = UnixListener::bind(&reply)?;
     let _reply_file = SocketFile(reply.clone());
     listener.set_nonblocking(true)?;
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(ready.with_extension("log"))?;
     let mut child = Command::new(std::env::current_exe()?)
-        .arg("--daemon").env(READY_ENV, &reply)
-        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-        .process_group(0).spawn()?;
+        .arg("--daemon")
+        .env(READY_ENV, &reply)
+        .env(COMMAND_START_ENV, if await_command { "1" } else { "0" })
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log))
+        .process_group(0)
+        .spawn()?;
     let deadline = Instant::now() + START_TIMEOUT;
     loop {
         match listener.accept() {
@@ -83,8 +137,15 @@ pub fn start() -> io::Result<()> {
                 let mut line = String::new();
                 BufReader::new(stream).take(8192).read_line(&mut line)?;
                 let result: Value = serde_json::from_str(&line)?;
-                return if result["ok"] == true { Ok(()) } else {
-                    Err(io::Error::other(result["error"].as_str().unwrap_or("sidebar initialization failed").to_owned()))
+                return if result["ok"] == true {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(
+                        result["error"]
+                            .as_str()
+                            .unwrap_or("sidebar initialization failed")
+                            .to_owned(),
+                    ))
                 };
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
@@ -94,45 +155,176 @@ pub fn start() -> io::Result<()> {
             if let Ok((stream, _)) = listener.accept() {
                 stream.set_read_timeout(Some(Duration::from_secs(3)))?;
                 let result: Value = serde_json::from_reader(stream.take(8192))?;
-                return if result["ok"] == true { Ok(()) } else {
-                    Err(io::Error::other(result["error"].as_str().unwrap_or("sidebar initialization failed").to_owned()))
+                return if result["ok"] == true {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(
+                        result["error"]
+                            .as_str()
+                            .unwrap_or("sidebar initialization failed")
+                            .to_owned(),
+                    ))
                 };
             }
-            return Err(io::Error::other(format!("sidebar daemon exited before readiness: {status}")));
+            return Err(io::Error::other(format!(
+                "sidebar daemon exited before readiness: {status}"
+            )));
         }
         if Instant::now() >= deadline {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "sidebar daemon initialization timed out"));
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "sidebar daemon initialization timed out",
+            ));
         }
         thread::sleep(Duration::from_millis(20));
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DockRequest {
+    command: dock_control::Command,
+    caller_tab_id: Option<String>,
+}
+
+pub fn dock_command(command: dock_control::Command) -> io::Result<()> {
+    start_inner(true)?;
+    let caller_tab_id = if !matches!(command, dock_control::Command::Toggle) {
+        None
+    } else if std::env::var_os("HERDR_PLUGIN_ACTION_ID").is_some() {
+        // The action's pane may close before it runs; its tab is the toggle target.
+        Some(
+            std::env::var("HERDR_TAB_ID")
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?,
+        )
+    } else {
+        match std::env::var("HERDR_PANE_ID") {
+            Ok(inherited) => {
+                let current = ipc::call("pane.current", json!({"caller_pane_id": inherited}))?;
+                Some(
+                    current["pane"]["tab_id"]
+                        .as_str()
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "pane.current omitted tab_id",
+                            )
+                        })?
+                        .to_owned(),
+                )
+            }
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidInput, error)),
+        }
+    };
+    let (_, ready) = daemon_paths()?;
+    let mut stream = UnixStream::connect(ready)?;
+    stream.set_read_timeout(Some(START_TIMEOUT))?;
+    stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+    serde_json::to_writer(
+        &mut stream,
+        &DockRequest {
+            command,
+            caller_tab_id,
+        },
+    )?;
+    stream.write_all(b"\n")?;
+    let mut line = String::new();
+    BufReader::new(stream.take(CONTROL_LIMIT)).read_line(&mut line)?;
+    if !line.ends_with('\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated dock command reply",
+        ));
+    }
+    let reply: Value = serde_json::from_str(&line)?;
+    if reply["ok"] == true {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            reply["error"]
+                .as_str()
+                .unwrap_or("dock command failed")
+                .to_owned(),
+        ))
+    }
+}
+
+fn handle_command(
+    mut stream: UnixStream,
+    controller: &mut dock_control::Controller,
+) -> io::Result<bool> {
+    stream.set_read_timeout(Some(POLL_INTERVAL))?;
+    stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+    let result = (|| {
+        let mut line = String::new();
+        BufReader::new((&mut stream).take(CONTROL_LIMIT)).read_line(&mut line)?;
+        if line.is_empty() {
+            return Ok(None);
+        } // Readiness probe.
+        if !line.ends_with('\n') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated dock command",
+            ));
+        }
+        let request: DockRequest = serde_json::from_str(&line)?;
+        controller.command(request.command, request.caller_tab_id.as_deref())?;
+        Ok(Some(()))
+    })();
+    let reply = match result {
+        Ok(None) => return Ok(false),
+        Ok(Some(())) => json!({"ok": true}),
+        Err(error) => json!({"ok": false, "error": error.to_string()}),
+    };
+    serde_json::to_writer(&mut stream, &reply)?;
+    stream.write_all(b"\n")?;
+    Ok(true)
+}
+
 fn notify_start(result: &io::Result<()>) -> io::Result<()> {
-    let Some(path) = std::env::var_os(READY_ENV) else { return Ok(()); };
+    let Some(path) = std::env::var_os(READY_ENV) else {
+        return Ok(());
+    };
     let mut stream = UnixStream::connect(path)?;
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
-    let reply = match result { Ok(()) => json!({"ok": true}), Err(error) => json!({"ok": false, "error": error.to_string()}) };
+    let reply = match result {
+        Ok(()) => json!({"ok": true}),
+        Err(error) => json!({"ok": false, "error": error.to_string()}),
+    };
     serde_json::to_writer(&mut stream, &reply)?;
     stream.write_all(b"\n")
 }
 
 pub fn run() -> io::Result<()> {
     let result = run_inner();
-    if result.is_err() { let _ = notify_start(&result); }
+    if result.is_err() {
+        let _ = notify_start(&result);
+    }
     result
 }
 
 fn run_inner() -> io::Result<()> {
     let (lock_path, ready_path) = daemon_paths()?;
-    let lock = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(lock_path)?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
     match lock.try_lock() {
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => {
             let deadline = Instant::now() + START_TIMEOUT;
             loop {
-                if UnixStream::connect(&ready_path).is_ok() { return notify_start(&Ok(())); }
+                if UnixStream::connect(&ready_path).is_ok() {
+                    return notify_start(&Ok(()));
+                }
                 if Instant::now() >= deadline {
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, "existing sidebar daemon did not become ready"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "existing sidebar daemon did not become ready",
+                    ));
                 }
                 thread::sleep(Duration::from_millis(50));
             }
@@ -145,84 +337,95 @@ fn run_inner() -> io::Result<()> {
         Err(error) => return Err(error),
     }
     let mut publisher = Publisher::default();
-    let initial_refresh = publisher.refresh()?;
-    if initial_refresh.is_none() { return notify_start(&Ok(())); }
-    let mut events = Some(subscribe()?);
+    let mut controller = dock_control::Controller::new(ready_path.with_extension("json"))?;
     let listener = UnixListener::bind(&ready_path)?;
     let _ready_file = SocketFile(ready_path);
     listener.set_nonblocking(true)?;
-    notify_start(&Ok(()))?;
     let socket = socket_path()?;
-    let mut next_deadline = initial_refresh.unwrap_or_else(|| Instant::now() + CATCH_ALL);
-
+    // A first toggle must arrive before auto-open, or it would close the dock
+    // that startup just created. Abandoned clients only defer startup briefly.
+    let awaiting_command = std::env::var(COMMAND_START_ENV).as_deref() == Ok("1");
+    let mut command_deadline = awaiting_command.then(|| Instant::now() + START_TIMEOUT);
+    let mut first = !awaiting_command;
+    if awaiting_command {
+        notify_start(&Ok(()))?;
+    }
     loop {
-        while listener.accept().is_ok() {}
-        let mut disconnected = false;
-        if let Some(reader) = events.as_mut() {
-            let timeout = next_deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
-            reader.get_ref().set_read_timeout(Some(timeout))?;
-            let mut bytes = [0; 16384];
-            match reader.read(&mut bytes) {
-                Ok(0) => disconnected = true,
-                Ok(_) => {}
-                Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
-                Err(_) => disconnected = true,
-            }
-        } else {
-            let wait = next_deadline.saturating_duration_since(Instant::now());
-            thread::sleep(wait);
-            match subscribe() {
-                Ok(reader) => {
-                    events = Some(reader);
-                    publisher = Publisher::default();
-                }
-                Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) => return Ok(()),
-                Err(error) => eprintln!("sidebar subscription: {error}"),
+        let started = Instant::now();
+        // Bound command work so queued callers cannot starve automatic following.
+        for _ in 0..16 {
+            match listener.accept() {
+                Ok((stream, _)) => match handle_command(stream, &mut controller) {
+                    Ok(true) => command_deadline = None,
+                    Ok(false) => {}
+                    Err(error) => {
+                        command_deadline = None;
+                        eprintln!("sidebar control: {error}");
+                    }
+                },
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
             }
         }
-        if disconnected {
-            events = None;
-            if !socket.exists() { return Ok(()); }
+        if command_deadline.is_some_and(|deadline| Instant::now() < deadline) {
+            thread::sleep(POLL_INTERVAL.saturating_sub(started.elapsed()));
+            continue;
         }
-        match publisher.refresh() {
-            Ok(None) => return Ok(()),
-            Ok(Some(due)) => {
-                next_deadline = due;
-            }
-            Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) && !socket.exists() => return Ok(()),
-            Err(error) => {
-                eprintln!("sidebar refresh: {error}");
-                thread::sleep(Duration::from_millis(SPIN_MS));
-                next_deadline = Instant::now() + CATCH_ALL;
-            }
+        command_deadline = None;
+        let refresh_started = Instant::now();
+        let refreshed = refresh_daemon(&mut publisher, &mut controller);
+        if first {
+            notify_start(
+                &refreshed
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|error| io::Error::other(error.to_string())),
+            )?;
+            first = false;
         }
+        match refreshed {
+            Ok(false) => return Ok(()),
+            Ok(true) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) && !socket.exists() =>
+            {
+                return Ok(())
+            }
+            Err(error) => eprintln!("sidebar refresh: {error}"),
+        }
+        thread::sleep(POLL_INTERVAL.saturating_sub(refresh_started.elapsed()));
     }
 }
 
-fn subscribe() -> io::Result<BufReader<UnixStream>> {
-    let mut stream = UnixStream::connect(socket_path()?)?;
-    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(3)))?;
-    let kinds = ["pane.created", "pane.closed", "pane.exited", "pane.agent_detected", "pane.moved",
-        "pane.focused", "tab.focused",
-        "workspace.created", "workspace.closed", "workspace.renamed", "workspace.moved", "workspace.reordered",
-        "worktree.created", "worktree.opened", "worktree.removed", "tab.created", "tab.closed", "tab.moved"];
-    let subscriptions: Vec<_> = kinds.iter().map(|kind| json!({"type": kind})).collect();
-    serde_json::to_writer(&mut stream, &json!({"id": "hps-events", "method": "events.subscribe", "params": {"subscriptions": subscriptions}}))?;
-    stream.write_all(b"\n")?;
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    (&mut reader).take(65536).read_line(&mut line)?;
-    let ack: Value = serde_json::from_str(&line)?;
-    if ack["id"] != "hps-events" || ack["result"]["type"] != "subscription_started" {
-        return Err(io::Error::other(format!("Herdr event subscription rejected: {ack}")));
-    }
-    Ok(reader)
+fn refresh_daemon(
+    publisher: &mut Publisher,
+    controller: &mut dock_control::Controller,
+) -> io::Result<bool> {
+    let settings = config::load()?;
+    let response = ipc::call("session.snapshot", json!({}))?;
+    let snapshot = &response["snapshot"];
+    // Both consumers run even if one fails; dock errors must not halt metadata.
+    let published = publisher.refresh(snapshot, &settings);
+    let reconciled = controller.reconcile(snapshot, &settings);
+    reconciled?;
+    published?;
+    Ok(settings.enabled)
 }
 
 fn entries<'a>(snapshot: &'a Value, key: &str) -> io::Result<&'a [Value]> {
-    snapshot.get(key).and_then(Value::as_array).map(Vec::as_slice)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("session.snapshot omitted {key}")))
+    snapshot
+        .get(key)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("session.snapshot omitted {key}"),
+            )
+        })
 }
 
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
@@ -230,7 +433,9 @@ fn text<'a>(value: &'a Value, key: &str) -> &'a str {
 }
 
 fn empty_tokens(keys: &[&str]) -> Tokens {
-    keys.iter().map(|key| ((*key).to_owned(), Value::Null)).collect()
+    keys.iter()
+        .map(|key| ((*key).to_owned(), Value::Null))
+        .collect()
 }
 
 fn chunk_tokens(tokens: Tokens, limit: usize) -> Vec<Tokens> {
@@ -250,47 +455,71 @@ fn chunk_tokens(tokens: Tokens, limit: usize) -> Vec<Tokens> {
 
 fn patch(pane: &str, tokens: Tokens) -> io::Result<()> {
     for chunk in chunk_tokens(tokens, 16) {
-        ipc::call("pane.report_metadata", json!({"pane_id": pane, "source": SOURCE, "tokens": chunk}))?;
+        ipc::call(
+            "pane.report_metadata",
+            json!({"pane_id": pane, "source": SOURCE, "tokens": chunk}),
+        )?;
     }
     Ok(())
 }
 
 fn patch_workspace(workspace: &str, tokens: Tokens) -> io::Result<()> {
     for chunk in chunk_tokens(tokens, 16) {
-        ipc::call("workspace.report_metadata", json!({"workspace_id": workspace, "source": SOURCE, "tokens": chunk}))?;
+        ipc::call(
+            "workspace.report_metadata",
+            json!({"workspace_id": workspace, "source": SOURCE, "tokens": chunk}),
+        )?;
     }
     Ok(())
 }
 
 pub fn refresh() -> io::Result<()> {
-    Publisher::default().refresh().map(|_| ())
+    let settings = config::load()?;
+    let response = ipc::call("session.snapshot", json!({}))?;
+    Publisher::default().refresh(&response["snapshot"], &settings)
 }
 
 pub fn clear() -> io::Result<()> {
     let response = ipc::call("session.snapshot", json!({}))?;
-    let panes = entries(&response["snapshot"], "panes")?;
-    let workspaces = entries(&response["snapshot"], "workspaces")?;
+    clear_snapshot(&response["snapshot"])
+}
+
+fn clear_snapshot(snapshot: &Value) -> io::Result<()> {
+    let panes = entries(snapshot, "panes")?;
+    let workspaces = entries(snapshot, "workspaces")?;
     let mut failure = None;
     for pane in panes {
         if KEYS.iter().any(|key| pane["tokens"].get(*key).is_some()) {
-            if let Err(error) = patch(text(pane, "pane_id"), empty_tokens(&KEYS)) { failure = Some(error); }
+            if let Err(error) = patch(text(pane, "pane_id"), empty_tokens(&KEYS)) {
+                failure = Some(error);
+            }
         }
     }
     for workspace in workspaces {
-        if SPACE_KEYS.iter().any(|key| workspace["tokens"].get(*key).is_some()) {
-            if let Err(error) = patch_workspace(text(workspace, "workspace_id"), empty_tokens(&SPACE_KEYS)) { failure = Some(error); }
+        if SPACE_KEYS
+            .iter()
+            .any(|key| workspace["tokens"].get(*key).is_some())
+        {
+            if let Err(error) =
+                patch_workspace(text(workspace, "workspace_id"), empty_tokens(&SPACE_KEYS))
+            {
+                failure = Some(error);
+            }
         }
     }
-    if let Err(error) = ipc::call("agent.view.clear", json!({"source": SOURCE})) { failure = Some(error); }
-    match failure { Some(error) => Err(error), None => Ok(()) }
+    if let Err(error) = ipc::call("agent.view.clear", json!({"source": SOURCE})) {
+        failure = Some(error);
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 pub struct Publisher {
     pub activity: ActivityStore,
     branches: BTreeMap<String, String>,
     branch_at: Option<Instant>,
-    last: HashMap<String, Tokens>,
-    last_workspaces: HashMap<String, Tokens>,
     grouped: Option<bool>,
     native_style: bool,
 }
@@ -301,8 +530,6 @@ impl Default for Publisher {
             activity: ActivityStore::new(config::state_dir()),
             branches: BTreeMap::new(),
             branch_at: None,
-            last: HashMap::new(),
-            last_workspaces: HashMap::new(),
             grouped: None,
             native_style: false,
         }
@@ -310,22 +537,19 @@ impl Default for Publisher {
 }
 
 impl Publisher {
-    pub fn refresh(&mut self) -> io::Result<Option<Instant>> {
-        let settings = config::load()?;
-        if !settings.enabled { clear()?; return Ok(None); }
+    pub fn refresh(&mut self, snapshot: &Value, settings: &config::Settings) -> io::Result<()> {
+        if !settings.enabled {
+            return clear_snapshot(snapshot);
+        }
         if !settings.project_style {
             if !self.native_style {
-                clear()?;
-                self.last.clear();
-                self.last_workspaces.clear();
+                clear_snapshot(snapshot)?;
                 self.grouped = None;
                 self.native_style = true;
             }
-            return Ok(Some(Instant::now() + CATCH_ALL));
+            return Ok(());
         }
         self.native_style = false;
-        let response = ipc::call("session.snapshot", json!({}))?;
-        let snapshot = &response["snapshot"];
         let agents = entries(snapshot, "agents")?;
         let workspaces = entries(snapshot, "workspaces")?;
         let tabs = entries(snapshot, "tabs")?;
@@ -333,9 +557,6 @@ impl Publisher {
 
         let now_ms = now_unix_ms();
         let spin_step = (now_ms / SPIN_MS) as usize;
-        let mut has_working = false;
-        let mut has_blocked = false;
-        let mut next_wake_ms = now_ms + CATCH_ALL.as_millis() as u64;
 
         // Branch map at TTL: one socket round trip per repo via native
         // worktree.list (5s); the per-row git probe is fallback only.
@@ -344,12 +565,20 @@ impl Publisher {
                 .iter()
                 .filter_map(|w| {
                     let r = text(&w["worktree"], "repo_root");
-                    if r.is_empty() { None } else { Some(r.to_owned()) }
+                    if r.is_empty() {
+                        None
+                    } else {
+                        Some(r.to_owned())
+                    }
                 })
                 .collect();
             roots.sort();
             roots.dedup();
-            if self.branch_at.map(|t| t.elapsed() >= Duration::from_secs(5)).unwrap_or(true) {
+            if self
+                .branch_at
+                .map(|t| t.elapsed() >= Duration::from_secs(5))
+                .unwrap_or(true)
+            {
                 self.branches = crate::ipc::branch_map(&roots);
                 self.branch_at = Some(Instant::now());
             }
@@ -362,24 +591,14 @@ impl Publisher {
 
             if status == "working" {
                 self.activity.mark_working(pane_id, now_ms);
-                has_working = true;
             }
-
-            if status == "blocked" {
-                has_blocked = true;
-            }
-
         }
 
         // Prune vanished panes: holds must never outlive their pane.
         let live: HashSet<&str> = agents.iter().map(|a| text(a, "pane_id")).collect();
-        self.activity.stamps.retain(|k, _| live.contains(k.as_str()));
-
-        // Determine next wake deadline
-        let now_instant = Instant::now();
-        if has_working || has_blocked {
-            next_wake_ms = next_wake_ms.min(now_ms + SPIN_MS);
-        }
+        self.activity
+            .stamps
+            .retain(|k, _| live.contains(k.as_str()));
 
         // 2. Generate row tokens
         let (wanted, wanted_workspaces) = rows(&RowsInput {
@@ -387,7 +606,7 @@ impl Publisher {
             workspaces,
             tabs,
             panes,
-            settings: &settings,
+            settings,
             activity: &self.activity,
             branches: &self.branches,
             now_ms,
@@ -399,13 +618,15 @@ impl Publisher {
         // leave stale beliefs installed.
         for pane in panes {
             let id = text(pane, "pane_id");
-            if !wanted.contains_key(id) && KEYS.iter().any(|key| pane["tokens"].get(*key).is_some()) {
+            if !wanted.contains_key(id) && KEYS.iter().any(|key| pane["tokens"].get(*key).is_some())
+            {
                 patch(id, empty_tokens(&KEYS))?;
             }
         }
         for (pane, tokens) in wanted {
             let live = panes.iter().find(|p| text(p, "pane_id") == pane);
-            let delta: Tokens = tokens.iter()
+            let delta: Tokens = tokens
+                .iter()
                 .filter(|(key, value)| live.and_then(|p| p["tokens"].get(*key)) != Some(*value))
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect();
@@ -416,8 +637,11 @@ impl Publisher {
 
         // 4. Patch workspaces (same live-token rule as panes).
         for (workspace, tokens) in wanted_workspaces {
-            let live = workspaces.iter().find(|w| text(w, "workspace_id") == workspace);
-            let delta: Tokens = tokens.iter()
+            let live = workspaces
+                .iter()
+                .find(|w| text(w, "workspace_id") == workspace);
+            let delta: Tokens = tokens
+                .iter()
                 .filter(|(key, value)| live.and_then(|w| w["tokens"].get(*key)) != Some(*value))
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect();
@@ -433,12 +657,14 @@ impl Publisher {
             } else {
                 json!([{"field": "state_change_seq", "order": "desc"}, {"field": "tab_order", "order": "asc"}, {"field": "pane_order", "order": "asc"}])
             };
-            ipc::call("agent.view.set", json!({"source": SOURCE, "label": if settings.grouped { "active" } else { "recent" }, "sort": sort}))?;
+            ipc::call(
+                "agent.view.set",
+                json!({"source": SOURCE, "label": if settings.grouped { "active" } else { "recent" }, "sort": sort}),
+            )?;
             self.grouped = Some(settings.grouped);
         }
 
-        let sleep_duration = Duration::from_millis(next_wake_ms.saturating_sub(now_ms).max(10));
-        Ok(Some(now_instant + sleep_duration))
+        Ok(())
     }
 }
 
@@ -480,44 +706,85 @@ pub fn rows(input: &RowsInput) -> (RowTokens, RowTokens) {
     let mut ws_agents: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
 
     for agent in agents {
-        let path = if text(agent, "foreground_cwd").is_empty() { text(agent, "cwd") } else { text(agent, "foreground_cwd") };
+        let path = if text(agent, "foreground_cwd").is_empty() {
+            text(agent, "cwd")
+        } else {
+            text(agent, "foreground_cwd")
+        };
         cwd.entry(text(agent, "workspace_id")).or_insert(path);
         let ws = text(agent, "workspace_id");
-        ws_agents.entry(ws).or_default().push((text(agent, "agent"), text(agent, "agent_status")));
+        ws_agents
+            .entry(ws)
+            .or_default()
+            .push((text(agent, "agent"), text(agent, "agent_status")));
     }
 
-    let mut spaces: HashMap<String, Workspace> = workspaces.iter().enumerate().map(|(index, ws)| {
-        let id = text(ws, "workspace_id").to_owned();
-        let tree = &ws["worktree"];
-        let label = if text(ws, "label").is_empty() { id.clone() } else { text(ws, "label").to_owned() };
-        let repo = text(tree, "repo_key");
-        let project = if text(tree, "repo_name").is_empty() { label.clone() } else { text(tree, "repo_name").to_owned() };
-        let checkout = text(tree, "checkout_path");
-        let branch = if !settings.show_branch {
-            None
-        } else {
-            branches
-                .get(checkout.trim_end_matches('/'))
-                .filter(|b| !b.is_empty())
-                .map(|b| b.to_owned())
-                .or_else(|| {
-                    git_branch(Path::new(if checkout.is_empty() { cwd.get(id.as_str()).copied().unwrap_or("") } else { checkout }))
-                })
-        };
-        (id.clone(), Workspace {
-            group: if repo.is_empty() { format!("workspace:{id}") } else { format!("repo:{repo}") },
-            id, project, label, branch, linked: tree["is_linked_worktree"].as_bool().unwrap_or(false),
-            order: ws["number"].as_u64().unwrap_or(index as u64),
+    let mut spaces: HashMap<String, Workspace> = workspaces
+        .iter()
+        .enumerate()
+        .map(|(index, ws)| {
+            let id = text(ws, "workspace_id").to_owned();
+            let tree = &ws["worktree"];
+            let label = if text(ws, "label").is_empty() {
+                id.clone()
+            } else {
+                text(ws, "label").to_owned()
+            };
+            let repo = text(tree, "repo_key");
+            let project = if text(tree, "repo_name").is_empty() {
+                label.clone()
+            } else {
+                text(tree, "repo_name").to_owned()
+            };
+            let checkout = text(tree, "checkout_path");
+            let branch = if !settings.show_branch {
+                None
+            } else {
+                branches
+                    .get(checkout.trim_end_matches('/'))
+                    .filter(|b| !b.is_empty())
+                    .map(|b| b.to_owned())
+                    .or_else(|| {
+                        git_branch(Path::new(if checkout.is_empty() {
+                            cwd.get(id.as_str()).copied().unwrap_or("")
+                        } else {
+                            checkout
+                        }))
+                    })
+            };
+            (
+                id.clone(),
+                Workspace {
+                    group: if repo.is_empty() {
+                        format!("workspace:{id}")
+                    } else {
+                        format!("repo:{repo}")
+                    },
+                    id,
+                    project,
+                    label,
+                    branch,
+                    linked: tree["is_linked_worktree"].as_bool().unwrap_or(false),
+                    order: ws["number"].as_u64().unwrap_or(index as u64),
+                },
+            )
         })
-    }).collect();
+        .collect();
 
     for agent in agents {
         let id = text(agent, "workspace_id");
         spaces.entry(id.to_owned()).or_insert_with(|| Workspace {
-            id: id.to_owned(), group: format!("workspace:{id}"), project: id.to_owned(),
+            id: id.to_owned(),
+            group: format!("workspace:{id}"),
+            project: id.to_owned(),
             label: id.to_owned(),
-            branch: if settings.show_branch { git_branch(Path::new(cwd.get(id).copied().unwrap_or(""))) } else { None },
-            linked: false, order: u64::MAX,
+            branch: if settings.show_branch {
+                git_branch(Path::new(cwd.get(id).copied().unwrap_or("")))
+            } else {
+                None
+            },
+            linked: false,
+            order: u64::MAX,
         });
     }
 
@@ -543,7 +810,7 @@ pub fn rows(input: &RowsInput) -> (RowTokens, RowTokens) {
         let mark_token = match chosen {
             "blocked" => "space_blocked".into(),
             "working" => match vendor {
-                "claude" | "gemini" | "kimi" | "deepseek" | "qwen" | "kiro" | "cline" | "kilo" => {
+                "claude" | "gemini" | "kimi" | "qwen" | "kiro" | "cline" | "kilo" => {
                     format!("space_working_{vendor}")
                 }
                 _ => "space_working_other".into(),
@@ -561,13 +828,17 @@ pub fn rows(input: &RowsInput) -> (RowTokens, RowTokens) {
         for &(v, _) in members {
             if seen_logos.insert(v) {
                 let logo_key = match v {
-                    "claude" | "gemini" | "kimi" | "deepseek" | "qwen" | "kiro" | "cline" | "kilo" => {
+                    "claude" | "gemini" | "kimi" | "qwen" | "kiro" | "cline" | "kilo" => {
                         format!("space_logo_{v}")
                     }
                     _ => "space_logo_other".into(),
                 };
                 let glyph = icons::logo(v, settings.icons).unwrap_or("");
-                let text = if glyph.is_empty() { v.to_owned() } else { format!("{glyph} {v}") };
+                let text = if glyph.is_empty() {
+                    v.to_owned()
+                } else {
+                    format!("{glyph} {v}")
+                };
                 tokens.insert(logo_key, json!(text));
             }
         }
@@ -575,23 +846,68 @@ pub fn rows(input: &RowsInput) -> (RowTokens, RowTokens) {
     }
 
     // Agent ordering
-    let tab_order: HashMap<_, _> = tabs.iter().enumerate().map(|(index, tab)| (text(tab, "tab_id"), tab["number"].as_u64().unwrap_or(index as u64))).collect();
-    let pane_order: HashMap<_, _> = panes.iter().enumerate().map(|(index, pane)| (text(pane, "pane_id"), index)).collect();
-    let mut ordered: Vec<_> = agents.iter().filter(|agent| !text(agent, "pane_id").is_empty()).collect();
+    let tab_order: HashMap<_, _> = tabs
+        .iter()
+        .enumerate()
+        .map(|(index, tab)| {
+            (
+                text(tab, "tab_id"),
+                tab["number"].as_u64().unwrap_or(index as u64),
+            )
+        })
+        .collect();
+    let pane_order: HashMap<_, _> = panes
+        .iter()
+        .enumerate()
+        .map(|(index, pane)| (text(pane, "pane_id"), index))
+        .collect();
+    let mut ordered: Vec<_> = agents
+        .iter()
+        .filter(|agent| !text(agent, "pane_id").is_empty())
+        .collect();
 
     // Native recency: state_change_seq orders turns; local clocks never do.
     fn seq(agent: &Value) -> u64 {
-        agent.get("state_change_seq").and_then(Value::as_u64).unwrap_or(0)
+        agent
+            .get("state_change_seq")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
     }
     ordered.sort_by(|a, b| {
         let wa = &spaces[text(a, "workspace_id")];
         let wb = &spaces[text(b, "workspace_id")];
-        (seq(b), &wa.group, wa.linked, wa.order, &wa.id,
-            tab_order.get(text(a, "tab_id")).copied().unwrap_or(u64::MAX),
-            pane_order.get(text(a, "pane_id")).copied().unwrap_or(usize::MAX), text(a, "pane_id"))
-            .cmp(&(seq(a), &wb.group, wb.linked, wb.order, &wb.id,
-                tab_order.get(text(b, "tab_id")).copied().unwrap_or(u64::MAX),
-                pane_order.get(text(b, "pane_id")).copied().unwrap_or(usize::MAX), text(b, "pane_id")))
+        (
+            seq(b),
+            &wa.group,
+            wa.linked,
+            wa.order,
+            &wa.id,
+            tab_order
+                .get(text(a, "tab_id"))
+                .copied()
+                .unwrap_or(u64::MAX),
+            pane_order
+                .get(text(a, "pane_id"))
+                .copied()
+                .unwrap_or(usize::MAX),
+            text(a, "pane_id"),
+        )
+            .cmp(&(
+                seq(a),
+                &wb.group,
+                wb.linked,
+                wb.order,
+                &wb.id,
+                tab_order
+                    .get(text(b, "tab_id"))
+                    .copied()
+                    .unwrap_or(u64::MAX),
+                pane_order
+                    .get(text(b, "pane_id"))
+                    .copied()
+                    .unwrap_or(usize::MAX),
+                text(b, "pane_id"),
+            ))
     });
 
     let mut seen_groups = HashSet::new();
@@ -631,13 +947,20 @@ pub fn rows(input: &RowsInput) -> (RowTokens, RowTokens) {
                 };
                 tokens.insert("group".into(), json!(header_text));
             }
-            if ordered.get(index + 1).is_some_and(|next| spaces[text(next, "workspace_id")].group != ws.group) {
+            if ordered
+                .get(index + 1)
+                .is_some_and(|next| spaces[text(next, "workspace_id")].group != ws.group)
+            {
                 tokens.insert("gap".into(), json!("\u{200b}"));
             }
         }
 
         // Indent & Logo
-        let indent = if settings.grouped && !is_head { "\u{200b}  " } else { "" };
+        let indent = if settings.grouped && !is_head {
+            "\u{200b}  "
+        } else {
+            ""
+        };
         let vendor = text(agent, "agent");
         let logo_glyph = icons::logo(vendor, settings.icons);
         if let Some(glyph) = logo_glyph {
@@ -688,30 +1011,55 @@ pub fn rows(input: &RowsInput) -> (RowTokens, RowTokens) {
 
 fn agent_title(agent: &Value, show_title: bool) -> &str {
     let name = text(agent, "agent");
-    if !show_title { return name; }
+    if !show_title {
+        return name;
+    }
     let supplied = text(agent, "title");
-    if !supplied.is_empty() { return supplied; }
+    if !supplied.is_empty() {
+        return supplied;
+    }
     let title = text(agent, "terminal_title_stripped");
-    if title.is_empty() { return name; }
+    if title.is_empty() {
+        return name;
+    }
     let title = if matches!(name, "omp" | "pi") {
-        title.strip_prefix("π ").unwrap_or(title)
-            .trim_start_matches(|ch: char| ch.is_whitespace() || ch == '>' || ('\u{2800}'..='\u{28ff}').contains(&ch))
-    } else { title };
-    if title.is_empty() { name } else { title }
+        title
+            .strip_prefix("π ")
+            .unwrap_or(title)
+            .trim_start_matches(|ch: char| {
+                ch.is_whitespace() || ch == '>' || ('\u{2800}'..='\u{28ff}').contains(&ch)
+            })
+    } else {
+        title
+    };
+    if title.is_empty() {
+        name
+    } else {
+        title
+    }
 }
 
 fn git_branch(start: &Path) -> Option<String> {
-    if !start.is_absolute() { return None; }
+    if !start.is_absolute() {
+        return None;
+    }
     for dir in start.ancestors() {
         let marker = dir.join(".git");
-        let git = if marker.is_dir() { marker } else if marker.is_file() {
+        let git = if marker.is_dir() {
+            marker
+        } else if marker.is_file() {
             let contents = fs::read_to_string(marker).ok()?;
             dir.join(contents.trim().strip_prefix("gitdir:")?.trim())
-        } else { continue; };
+        } else {
+            continue;
+        };
         let head = fs::read_to_string(git.join("HEAD")).ok()?;
         let head = head.trim();
-        if let Some(branch) = head.strip_prefix("ref: refs/heads/") { return Some(branch.to_owned()); }
-        return (head.len() >= 7 && head.bytes().all(|byte| byte.is_ascii_hexdigit())).then(|| head[..7].to_owned());
+        if let Some(branch) = head.strip_prefix("ref: refs/heads/") {
+            return Some(branch.to_owned());
+        }
+        return (head.len() >= 7 && head.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .then(|| head[..7].to_owned());
     }
     None
 }
@@ -736,9 +1084,7 @@ mod tests {
             json!({"pane_id": "p1", "workspace_id": "w1", "agent": "claude", "agent_status": "idle", "focused": false}),
             json!({"pane_id": "p2", "workspace_id": "w1", "agent": "claude", "agent_status": "done", "focused": false}),
         ];
-        let workspaces = vec![
-            json!({"workspace_id": "w1", "label": "demo"}),
-        ];
+        let workspaces = vec![json!({"workspace_id": "w1", "label": "demo"})];
         let settings = config::Settings::default();
 
         let (panes, _) = rows(&RowsInput {

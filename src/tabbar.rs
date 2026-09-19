@@ -6,7 +6,8 @@ pub fn format_tabbar() -> io::Result<()> {
     let cwd = std::env::var("HERDR_ACTIVE_PANE_CWD").unwrap_or_default();
     // Pane cwds can sit anywhere (nested dirs, linked checkouts, even spaces
     // Herdr hasn't opened): longest-prefix across every repo's checkout map.
-    let branch = checkout_branch_map().into_iter()
+    let branch = checkout_branch_map()
+        .into_iter()
         .filter(|(path, _)| cwd == *path || cwd.starts_with(&format!("{path}/")))
         .max_by_key(|(path, _)| path.len())
         .map(|(_, branch)| branch);
@@ -15,7 +16,11 @@ pub fn format_tabbar() -> io::Result<()> {
 }
 
 fn cwd_opt(cwd: &str) -> Option<&str> {
-    if cwd.is_empty() { None } else { Some(cwd) }
+    if cwd.is_empty() {
+        None
+    } else {
+        Some(cwd)
+    }
 }
 
 /// Every known checkout across repos: spaceless worktrees included.
@@ -27,7 +32,11 @@ fn checkout_branch_map() -> std::collections::BTreeMap<String, String> {
             let mut roots: Vec<String> = spaces
                 .iter()
                 .filter_map(|w| {
-                    w["worktree"].get("repo_root")?.as_str().filter(|r| !r.is_empty()).map(str::to_owned)
+                    w["worktree"]
+                        .get("repo_root")?
+                        .as_str()
+                        .filter(|r| !r.is_empty())
+                        .map(str::to_owned)
                 })
                 .collect();
             roots.sort();
@@ -58,7 +67,11 @@ pub fn shorten_path(cwd: &str, max_len: usize) -> String {
         trimmed.to_owned()
     };
     if formatted.len() <= max_len || formatted.is_empty() {
-        return if formatted.is_empty() { "/".into() } else { formatted };
+        return if formatted.is_empty() {
+            "/".into()
+        } else {
+            formatted
+        };
     }
 
     let parts: Vec<&str> = formatted.split('/').collect();

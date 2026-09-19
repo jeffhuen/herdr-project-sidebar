@@ -4,6 +4,10 @@ Project and agent management for Herdr, providing two modes:
 1. **Terminal Dock:** an interactive Ratatui split pane with a collapsible `project -> worktree -> agent` tree, keyboard navigation, and Enter/click socket focusing.
 2. **Native Sidebar:** customizes Herdr's built-in Agents and Spaces lists with project headers, nested worktree branches, vendor-colored icons, status titles, and a settings popup.
 
+These are separate presentation implementations, not interchangeable skins.
+Both use Herdr's agent and workspace state. The dock uses native APIs for
+navigation and pane placement; native-sidebar styling does not control it.
+
 ## Build and enable
 
 Requires Herdr 0.9.1+, Rust 1.89+, and Linux or macOS.
@@ -16,12 +20,19 @@ herdr plugin action invoke configure --plugin herdr-project-sidebar
 ```
 
 `plugin link` does not build or run startup hooks. The configure action starts
-one metadata publisher per server and backs up the configuration before editing
-it. Future server starts launch the publisher automatically. No server restart
-is needed.
+one controller per server, applies native row styling, and opens the dock when
+automatic opening is enabled. Future server starts launch the controller
+automatically. No server restart is needed.
 
 ## Controls
 
+- `prefix+a` closes the dock in the current tab, or moves/opens it there.
+  Closing it suppresses automatic opening in that tab until you toggle it open.
+  Toggle actions retain their originating tab even if the invoking dock pane
+  closes before the action runs.
+- In the dock, `j/k` or arrows browse, `Enter` activates, and `h/l` fold/unfold.
+  Browsing does not snap back after a timeout. Click and release on a row to
+  activate it. `p` pins, `/` filters, `[`/`]` change width, and `q` closes.
 - `prefix+p` switches between Projects styling and your previous Herdr rows.
   It changes both the row layout and the sort override, without moving focus,
   closing the sidebar, or creating panes. This replaces the default previous-tab
@@ -37,7 +48,7 @@ The prefix is `Ctrl+b` unless you changed it in Herdr. Conflicting custom
 bindings cause configuration to fail without replacing the file.
 Herdr 0.9.1 does not expose plugin actions in its mouse menus, so settings must
 be opened by shortcut or CLI. Once open, every control supports the mouse.
-The native sidebar stays on the left; there is no right-dock setting.
+Herdr's native sidebar stays on the left. The terminal dock supports either side.
 
 ## Settings
 
@@ -47,9 +58,11 @@ Settings persist in `config.toml` under the directory printed by:
 herdr plugin config-dir herdr-project-sidebar
 ```
 
-- **Width:** 24-80 columns, applied live through Herdr's native width bounds.
-- **Start open by default:** initial visibility for a new client. Herdr's saved
-  manual hide/show choice takes precedence, including after reattachment.
+- **Width:** 24-80 columns for the dock split. Herdr's split-ratio limits can
+  constrain the width in narrow layouts.
+- **Dock side:** left or right, applied to the existing pane without restarting it.
+- **Start open by default:** create a missing dock in tabs you have not manually
+  closed it in. An already open dock continues following when this is off.
 - **Order:** project/worktree groups in workspace order, or recent native state
   changes. This does not create a separate activity history.
 - **Branches:** worktree headers and native Spaces branch/git-status rows.
@@ -64,10 +77,10 @@ states purple. Agent logos use vendor colors. Project groups have aligned rows
 and one blank line between groups. Colors adapt to the configured light or dark
 theme when configuration is applied; the host theme itself is preserved.
 
-Status comes directly from Herdr. Agent-row marks are static; the plugin has no
-separate completion, blocked-state, inactivity, desktop-theme, or tab-bar engine.
-Herdr still owns the Spaces/Agents split. Drag its horizontal divider to give
-Agents more room; Herdr 0.9.1 reserves at least 10% and three rows for Spaces.
+Agent status comes directly from Herdr. Native row marks are static; the dock
+animates working rows and uses activity timestamps only for idle freshness.
+Herdr owns the Spaces/Agents split. Drag its horizontal divider to give Agents
+more room. The tab-bar formatter is scheduled separately by Herdr.
 
 With `herdr --remote … --remote-keybindings server`, the native client still
 reads its own local row templates and fonts. Server keybindings do not synchronize
@@ -113,20 +126,31 @@ Before unlinking or uninstalling:
 herdr plugin action invoke unconfigure --plugin herdr-project-sidebar
 ```
 
-This stops the publisher, clears its metadata and sort override, and restores
-only configuration values that still match the plugin's last write. Later user
-edits and unrelated bindings remain. The original configuration backup and
-ownership record live under `HERDR_PLUGIN_STATE_DIR`.
-
-Version 0.2 replaces the old terminal dock. Its launcher, per-tab snoozes,
-collapse/pin/activity state, and `open-projects`/`toggle-projects` actions are
-removed. Old `state.json` and `settings.json` files are left untouched and are
-not read. Close any old dock manually after switching to the native version.
+This stops the controller, closes its dock, clears its metadata and sort override,
+and restores only configuration values that still match the plugin's last write.
+Later user edits and unrelated bindings remain. The original configuration backup,
+ownership record, and dock pin/fold state live under `HERDR_PLUGIN_STATE_DIR`.
 
 ## Runtime
 
-One Rust publisher reads Herdr's atomic `session.snapshot`, wakes on topology
-events, and checks titles and settings on a one-second heartbeat. It writes only
-changed display tokens. It never reports agent state or subscribes to
-`pane.updated`, and it spawns no command per event. Ratatui runs only while the
-settings popup is open.
+One Rust controller reads Herdr's atomic `session.snapshot` on a 300ms floor.
+It writes only changed display tokens and moves the same dock with `pane.move`.
+Cross-workspace moves change the public pane ID, not the terminal or process.
+Focus events do not spawn launchers. Neither process subscribes to `pane.updated`.
+The dock polls at a 300ms floor, skips unchanged frames, and renders a window
+around the browsing cursor.
+
+Placement uses native splits and absolute ratios. Moving into or out of a zoomed
+tab waits until you unzoom it. Existing multi-row layouts are preserved; the dock
+splits an edge content pane rather than rebuilding the whole tab.
+
+The terminal dock follows server-global focus, not an individual client's view.
+A single dock cannot occupy different tabs for two clients at once. Public focus
+commands can also redirect other clients. Use Herdr's native lists when independent
+client navigation is required.
+
+Herdr 0.9.1 can deliver a terminal click before its queued pane-focus operation.
+That late operation can override the dock's requested destination. The dock sends
+one activation on release and does not run delayed focus retries. Keyboard Enter
+avoids this mouse ordering race. Tracked in
+[Herdr #4390](https://github.com/herdrdev/herdr/issues/4390).

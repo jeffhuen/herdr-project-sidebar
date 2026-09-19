@@ -17,15 +17,15 @@ platforms = ["linux", "macos"]
 
 [[actions]]
 id = "open-projects"
-title = "Projects: open dock"
-description = "Open the project sidebar dock in a split (focus it if already open)."
-command = ["bash", "scripts/open-projects.sh"]
+title = "Projects: ensure dock"
+description = "Follow the current tab without changing focus; respect automatic opening and manually closed tabs."
+command = ["./target/release/herdr-project-sidebar", "--ensure"]
 platforms = ["linux", "macos"]
 
 [[actions]]
 id = "toggle-projects"
 title = "Projects: toggle dock"
-description = "Close the project sidebar dock if focused in this tab, otherwise open/focus it."
+description = "Close the project sidebar dock in this tab, otherwise move or open it here and focus it."
 command = ["./target/release/herdr-project-sidebar", "--toggle"]
 platforms = ["linux", "macos"]
 
@@ -70,17 +70,3 @@ command = ["./target/release/herdr-project-sidebar", "--install-font"]
 [[startup]]
 command = ["./target/release/herdr-project-sidebar", "--start"]
 
-[[events]]
-on = "pane.focused"
-command = ["./target/release/herdr-project-sidebar", "--ensure"]
-platforms = ["linux", "macos"]
-
-[[events]]
-on = "tab.focused"
-command = ["./target/release/herdr-project-sidebar", "--ensure"]
-platforms = ["linux", "macos"]
-
-[[events]]
-on = "workspace.focused"
-command = ["./target/release/herdr-project-sidebar", "--ensure"]
-platforms = ["linux", "macos"]

@@ -1,6 +1,6 @@
 //! Agent codepoints and animation glyphs matching Radar.
-use std::{fs, io, path::PathBuf};
 use crate::config::IconMode;
+use std::{fs, io, path::PathBuf};
 
 pub const FRAMES: [&str; 8] = ["⣷", "⣯", "⣟", "⡿", "⢿", "⣻", "⣽", "⣾"];
 
@@ -9,7 +9,11 @@ pub fn spinner(step: usize) -> &'static str {
 }
 
 pub fn blocked_mark(step: usize) -> &'static str {
-    if (step / 5) % 2 == 1 { "·" } else { "?" }
+    if (step / 5) % 2 == 1 {
+        "·"
+    } else {
+        "?"
+    }
 }
 
 pub fn state_mark(state: &str) -> &'static str {
@@ -60,10 +64,30 @@ pub fn logo(agent: &str, mode: IconMode) -> Option<&'static str> {
 #[allow(dead_code)]
 pub fn all_vendors() -> &'static [&'static str] {
     &[
-        "claude", "codex", "opencode", "omp", "cline", "mastracode",
-        "kimi", "kilo", "maki", "pi", "hermes", "cursor", "copilot",
-        "deepseek", "gemini", "gpt", "qwen", "grok", "agy", "kiro",
-        "amp", "devin", "qodercli", "glm",
+        "claude",
+        "codex",
+        "opencode",
+        "omp",
+        "cline",
+        "mastracode",
+        "kimi",
+        "kilo",
+        "maki",
+        "pi",
+        "hermes",
+        "cursor",
+        "copilot",
+        "deepseek",
+        "gemini",
+        "gpt",
+        "qwen",
+        "grok",
+        "agy",
+        "kiro",
+        "amp",
+        "devin",
+        "qodercli",
+        "glm",
     ]
 }
 
@@ -72,18 +96,26 @@ pub fn install() -> io::Result<PathBuf> {
     let directory = if cfg!(target_os = "macos") {
         PathBuf::from(home).join("Library/Fonts")
     } else {
-        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from)
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(home).join(".local/share"))
             .join("fonts/herdr-project-sidebar")
     };
     fs::create_dir_all(&directory)?;
     let path = directory.join("HerdrAgentIconsCompact-Regular.ttf");
-    fs::write(&path, include_bytes!("../assets/HerdrAgentIconsCompact-Regular.ttf"))?;
+    fs::write(
+        &path,
+        include_bytes!("../assets/HerdrAgentIconsCompact-Regular.ttf"),
+    )?;
     if cfg!(target_os = "linux") {
-        let result = std::process::Command::new("fc-cache").arg(&directory).output()?;
+        let result = std::process::Command::new("fc-cache")
+            .arg(&directory)
+            .output()?;
         if !result.status.success() {
-            return Err(io::Error::other(format!("Font copied; fc-cache failed: {}",
-                String::from_utf8_lossy(&result.stderr).trim())));
+            return Err(io::Error::other(format!(
+                "Font copied; fc-cache failed: {}",
+                String::from_utf8_lossy(&result.stderr).trim()
+            )));
         }
     }
     Ok(path)

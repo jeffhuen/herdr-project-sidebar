@@ -14,10 +14,8 @@
 //! is written back; light/dark follows whatever theme is configured.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::OpenOptions;
 use std::io;
 use std::process::Command;
-use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{
@@ -25,36 +23,24 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
 };
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::Terminal;
 use serde::Deserialize;
-
-// ponytail: single file; split into snapshot/tree/ui modules only when it
-// passes ~1500 lines. Polling CLI (not socket events) is the ceiling: socket
-// subscribe + async reads when 1s snapshots measurably lag.
 
 const SPINNER: [&str; 8] = ["⣷", "⣯", "⣟", "⡿", "⢿", "⣻", "⣽", "⣾"];
 const TICK: Duration = Duration::from_millis(150);
 const IDLE_POLL: Duration = Duration::from_millis(300);
-// 300ms, not 1s: one socket snapshot is ~1ms (no spawns since the socket
-// migration) plus a few HEAD reads, so polling faster costs nothing and the
-// highlight tracks the sidebar within a frame or two. True event-push would
-// need a subscriber thread per dock for ~200ms more; not worth it.
+// Bound snapshot reads independently of animation and input.
 const SNAPSHOT_MIN_AGE: Duration = Duration::from_millis(300);
 const BRANCH_TTL: Duration = Duration::from_secs(5);
-const SIDE_TTL: Duration = Duration::from_secs(30);
-const DRIVE_HOLD: Duration = Duration::from_secs(3);
 /// Explicit holds outvote adopted vetoes this long; afterwards recency is
 /// unknowable and vetoes apply normally so stale pins always converge away.
 const VETO_GRACE_SECS: u64 = 60;
-/// Drive window: manual navigation holds the seat this long so arrow/j/k
-/// browsing (and Enter on the aimed row) lands before the cursor re-glues
-/// to Herdr focus. External focus moves seat immediately regardless.
 const STATE_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
 
 const FRESH_SECS: u64 = 15 * 60;
@@ -152,6 +138,18 @@ enum Row {
     Agent(usize, usize, usize),
 }
 
+fn row_key<'a>(projects: &'a [Project], rows: &[Row], idx: usize) -> Option<(u8, &'a str)> {
+    Some(match *rows.get(idx)? {
+        Row::Project(pi) => (0, &projects[pi].id),
+        Row::Worktree(pi, wi) => (1, &projects[pi].worktrees[wi].key),
+        Row::Agent(pi, wi, ai) => (2, &projects[pi].worktrees[wi].agents[ai].pane_id),
+    })
+}
+
+fn row_index(projects: &[Project], rows: &[Row], key: (u8, &str)) -> Option<usize> {
+    (0..rows.len()).find(|&idx| row_key(projects, rows, idx) == Some(key))
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum View {
     Grouped,
@@ -234,11 +232,11 @@ fn stub() -> Vec<Project> {
                 workspace_id: "".into(),
                 agents: vec![Agent {
                     vendor: "claude".into(),
-                        label: "claude".into(),
+                    label: "claude".into(),
                     title: "Which env file should I edit?".into(),
                     state: State::Blocked,
                     pane_id: "".into(),
-                        workspace_id: "".into(),
+                    workspace_id: "".into(),
                     tab_id: "".into(),
                     seq: 0,
                     focused: false,
@@ -506,7 +504,9 @@ fn agent_title(e: &AgentEntry) -> String {
     if let Some(t) = e.title.as_deref().filter(|t| !t.is_empty()) {
         return t.to_string();
     }
-    let raw = e.terminal_title_stripped.as_deref()
+    let raw = e
+        .terminal_title_stripped
+        .as_deref()
         .filter(|t| !t.is_empty())
         .or_else(|| e.terminal_title.as_deref().filter(|t| !t.is_empty()));
 
@@ -515,7 +515,9 @@ fn agent_title(e: &AgentEntry) -> String {
             t.strip_prefix("π ")
                 .or_else(|| t.strip_prefix("π"))
                 .unwrap_or(t)
-                .trim_start_matches(|ch: char| ch.is_whitespace() || ch == '>' || ('\u{2800}'..='\u{28ff}').contains(&ch))
+                .trim_start_matches(|ch: char| {
+                    ch.is_whitespace() || ch == '>' || ('\u{2800}'..='\u{28ff}').contains(&ch)
+                })
                 .trim_start()
         } else {
             t
@@ -550,9 +552,8 @@ fn seat_row(projects: &[Project], rows: &[Row], focused_pane: Option<&str>) -> O
     focused_pane
         .and_then(|id| focus_row(projects, rows, id))
         .or_else(|| {
-            rows.iter().position(|r| {
-                matches!(*r, Row::Project(pi) if projects[pi].focused)
-            })
+            rows.iter()
+                .position(|r| matches!(*r, Row::Project(pi) if projects[pi].focused))
         })
 }
 
@@ -585,26 +586,33 @@ fn snapshot(
         .map(|s| envelope(s, "workspaces"))
         .or_else(|| herdr_json(&["workspace", "list"]));
     if agents_v.is_none() && workspaces_v.is_none() {
-        return (Vec::new(), Some("herdr unreachable (agent + workspace list failed)".into()));
+        return (
+            Vec::new(),
+            Some("herdr unreachable (agent + workspace list failed)".into()),
+        );
     }
     let now = now_secs();
     let mut agents: Vec<AgentEntry> = agents_v
         .as_ref()
         .and_then(|v| v.pointer("/result/agents"))
-        .and_then(|v| v.as_array().map(|a| {
-            a.iter()
-                .filter_map(|e| serde_json::from_value(e.clone()).ok())
-                .collect()
-        }))
+        .and_then(|v| {
+            v.as_array().map(|a| {
+                a.iter()
+                    .filter_map(|e| serde_json::from_value(e.clone()).ok())
+                    .collect()
+            })
+        })
         .unwrap_or_default();
     let workspaces: Vec<WorkspaceEntry> = workspaces_v
         .as_ref()
         .and_then(|v| v.pointer("/result/workspaces"))
-        .and_then(|v| v.as_array().map(|a| {
-            a.iter()
-                .filter_map(|e| serde_json::from_value(e.clone()).ok())
-                .collect()
-        }))
+        .and_then(|v| {
+            v.as_array().map(|a| {
+                a.iter()
+                    .filter_map(|e| serde_json::from_value(e.clone()).ok())
+                    .collect()
+            })
+        })
         .unwrap_or_default();
 
     // Stamp work for the idle freshness decoration. Lifecycle states are
@@ -621,8 +629,10 @@ fn snapshot(
         mem.activity.retain(|k, _| live.contains(k.as_str()));
     }
 
-    let ws_by_id: BTreeMap<&str, &WorkspaceEntry> =
-        workspaces.iter().map(|w| (w.workspace_id.as_str(), w)).collect();
+    let ws_by_id: BTreeMap<&str, &WorkspaceEntry> = workspaces
+        .iter()
+        .map(|w| (w.workspace_id.as_str(), w))
+        .collect();
     // Native branch map, refreshed at TTL: one socket round trip per repo.
     {
         let mut roots: Vec<String> = ws_by_id
@@ -633,7 +643,11 @@ fn snapshot(
             .collect();
         roots.sort();
         roots.dedup();
-        if mem.branch_at.map(|t| t.elapsed() >= BRANCH_TTL).unwrap_or(true) {
+        if mem
+            .branch_at
+            .map(|t| t.elapsed() >= BRANCH_TTL)
+            .unwrap_or(true)
+        {
             mem.branches = crate::ipc::branch_map(&roots);
             mem.branch_at = Some(std::time::Instant::now());
         }
@@ -904,11 +918,16 @@ fn snapshot(
         let (pinned, focused, collapsed) = match key {
             PJKey::Repo(_) => (
                 member_ids.iter().any(|m| mem.pinned.contains(*m)),
-                member_ids.iter().filter_map(|m| ws_of(m)).any(|w| w.focused),
+                member_ids
+                    .iter()
+                    .filter_map(|m| ws_of(m))
+                    .any(|w| w.focused),
                 // Collapse prefs migrate: a merged project honors any
                 // member's old workspace key.
                 mem.collapsed_projects.contains(&id)
-                    || member_ids.iter().any(|m| mem.collapsed_projects.contains(*m)),
+                    || member_ids
+                        .iter()
+                        .any(|m| mem.collapsed_projects.contains(*m)),
             ),
             PJKey::Solo(_) => (
                 mem.pinned.contains(&id),
@@ -1044,7 +1063,12 @@ fn rule_color(text: &str, state: &str) -> Option<Color> {
 fn custom_color(text: &str, key: &str) -> Option<Color> {
     for line in text.lines() {
         let line = line.trim();
-        if line.starts_with(key) && line.get(key.len()..).map(|r| r.starts_with([' ', '\t', '='])).unwrap_or(false) {
+        if line.starts_with(key)
+            && line
+                .get(key.len()..)
+                .map(|r| r.starts_with([' ', '\t', '=']))
+                .unwrap_or(false)
+        {
             if let Some(v) = line.split('=').nth(1) {
                 // Quoted first (hex lives inside quotes); unquoted falls
                 // back to the token before any trailing comment.
@@ -1138,7 +1162,10 @@ fn font_notice_due(choice: &str, detected: bool) -> bool {
 }
 
 fn font_ok() -> bool {
-    if std::env::var("HERDR_SIDEBAR_FONT").map(|v| v == "0").unwrap_or(false) {
+    if std::env::var("HERDR_SIDEBAR_FONT")
+        .map(|v| v == "0")
+        .unwrap_or(false)
+    {
         return false;
     }
     let home = std::env::var("HOME").unwrap_or_default();
@@ -1165,7 +1192,11 @@ fn font_ok() -> bool {
     for dir in depth1 {
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for e in entries.flatten() {
-                if e.file_name().to_string_lossy().to_lowercase().contains("nerd") {
+                if e.file_name()
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains("nerd")
+                {
                     return true;
                 }
             }
@@ -1173,7 +1204,9 @@ fn font_ok() -> bool {
     }
     // The binary's own dir may ship beside a font marker; Ghostty/kitty with
     // the radar icon font also satisfy this via config below.
-    std::env::var("HERDR_SIDEBAR_FONT").map(|v| v == "1").unwrap_or(false)
+    std::env::var("HERDR_SIDEBAR_FONT")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 // ---------- state.json ----------
@@ -1271,8 +1304,8 @@ fn save_state(mem: &mut Memory, force: bool) {
     }
     mem.last_state_save = Some(now);
     mem.dirty_state = false;
-    // Merge with the file instead of overwriting: a second sidebar (one per
-    // tab is the intended shape) may have folded/pinned since our load.
+    // Merge with the file: a dock in another native session may have saved
+    // folds or pins since our load.
     // Union for adds, max for stamps. Removals are SHARED vetoes: adopt the
     // file's dropped set (another dock's unpin applies here too), republish
     // the merge, prune vetoes nothing holds anymore. Explicit holds here
@@ -1281,14 +1314,13 @@ fn save_state(mem: &mut Memory, force: bool) {
     mem.dropped.extend(
         file.get("dropped")
             .and_then(|x| x.as_array())
-            .map(|a| {
-                a.iter().filter_map(|x| x.as_str().map(str::to_string))
-            })
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)))
             .into_iter()
             .flatten(),
     );
     let now = now_secs();
-    mem.touched.retain(|_, at| now.saturating_sub(*at) < VETO_GRACE_SECS);
+    mem.touched
+        .retain(|_, at| now.saturating_sub(*at) < VETO_GRACE_SECS);
     for t in mem.touched.keys() {
         mem.dropped.remove(t);
     }
@@ -1300,7 +1332,9 @@ fn save_state(mem: &mut Memory, force: bool) {
         let mut out = own.clone();
         if let Some(a) = file.get(k).and_then(|x| x.as_array()) {
             out.extend(a.iter().filter_map(|x| {
-                x.as_str().filter(|s| !mem.dropped.contains(&format!("{ns}:{s}"))).map(str::to_string)
+                x.as_str()
+                    .filter(|s| !mem.dropped.contains(&format!("{ns}:{s}")))
+                    .map(str::to_string)
             }));
         }
         out.into_iter().collect::<Vec<_>>()
@@ -1338,700 +1372,21 @@ fn save_state(mem: &mut Memory, force: bool) {
     }
 }
 
-// ---------- Launcher (--toggle/--ensure, launch.rs model) ----------
-
-/// Pure decision over a `pane list` JSON: our pane is the one in `scope_tab`
-/// titled [`PANE_TITLE`]. Stale/unparseable input degrades to `OPEN`.
-fn launch_decision(pane_list_json: &str, scope_tab: &str) -> String {
-    let v: serde_json::Value = match serde_json::from_str(pane_list_json) {
-        Ok(v) => v,
-        Err(_) => return "OPEN".into(),
-    };
-    let panes = v
-        .pointer("/result/panes")
-        .and_then(|p| p.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let tab_of = |id: &str| panes.iter().find(|p| p.get("pane_id").and_then(|x| x.as_str()) == Some(id));
-    let scope = if scope_tab.is_empty() {
-        panes
-            .iter()
-            .find(|p| p.get("focused").and_then(|x| x.as_bool()).unwrap_or(false))
-            .and_then(|p| p.get("tab_id").and_then(|x| x.as_str()))
-            .unwrap_or("")
-            .to_string()
-    } else {
-        scope_tab.to_string()
-    };
-    for p in &panes {
-        // Exact server label, never a title substring: titles are
-        // user/agent-controlled and a contains-match once targeted a user
-        // pane. The manifest pane title ("Projects") is the label Herdr
-        // reports for plugin panes.
-        let label = p.get("label").and_then(|x| x.as_str()).unwrap_or("");
-        let tab = p.get("tab_id").and_then(|x| x.as_str()).unwrap_or("");
-        if label == PANE_TITLE && (scope.is_empty() || tab == scope) {
-            let id = p.get("pane_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let focused = p.get("focused").and_then(|x| x.as_bool()).unwrap_or(false);
-            if !is_flag_safe(&id) {
-                return "OPEN".into();
-            }
-            if focused {
-                return format!("CLOSE {id}");
-            }
-            let _ = tab_of; // scope already confines the match
-            return format!("FOCUS {id}");
-        }
-    }
-    "OPEN".into()
-}
-
 /// True when the id can be passed as a positional CLI argument without any
 /// risk of being parsed as a flag. Server-issued ids match this; anything
 /// else is refused rather than executed.
 fn is_flag_safe(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
-        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == ':' || c == '_' || c == '-')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == ':' || c == '_' || c == '-')
 }
 
-/// First stderr line, trimmed to footer width. Herdr reports server errors as
-/// JSON on stderr -- the diagnosis is already in the buffer.
-fn first_stderr(out: &std::process::Output) -> String {
-    String::from_utf8_lossy(&out.stderr)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .chars()
-        .take(100)
-        .collect()
+/// Native pane navigation also works if agent detection changes after rendering.
+fn focus_session(pane_id: &str) -> io::Result<()> {
+    crate::ipc::call("pane.focus", serde_json::json!({ "pane_id": pane_id })).map(|_| ())
 }
-
-#[allow(dead_code)]
-struct LaunchLock(std::fs::File);
-impl LaunchLock {
-    fn try_acquire() -> Option<Self> {
-        let lock_path = crate::config::state_dir().join("launcher.lock");
-        let file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(lock_path).ok()?;
-        if file.try_lock().is_ok() {
-            Some(LaunchLock(file))
-        } else {
-            None
-        }
-    }
-}
-
-/// Per-tab snooze: a toggle-close parks a marker so quiet ensure leaves
-/// that tab alone; every other tab still autoloads under settings.auto_open.
-/// Swept against live tabs so closed tabs don't accumulate markers.
-fn snooze_dir() -> std::path::PathBuf {
-    crate::config::state_dir().join("snoozed")
-}
-fn snooze_set(dir: &std::path::Path, tab: &str) {
-    if tab.is_empty() || !is_flag_safe(tab) {
-        return;
-    }
-    let _ = std::fs::create_dir_all(dir);
-    let _ = std::fs::write(dir.join(tab), b"");
-}
-fn snooze_clear(dir: &std::path::Path, tab: &str) {
-    if tab.is_empty() {
-        return;
-    }
-    let _ = std::fs::remove_file(dir.join(tab));
-}
-fn snooze_is_set(dir: &std::path::Path, tab: &str) -> bool {
-    !tab.is_empty() && dir.join(tab).exists()
-}
-fn snooze_sweep(dir: &std::path::Path, live: &std::collections::BTreeSet<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if !live.contains(&name) {
-            let _ = std::fs::remove_file(e.path());
-        }
-    }
-}
-
-/// Pane list over the socket (verified /panes envelope); CLI fallback for
-/// socket-less dev runs. Hooks fire per focus event and must not spawn.
-fn pane_list() -> Vec<serde_json::Value> {
-    crate::ipc::call("pane.list", serde_json::json!({}))
-        .ok()
-        .and_then(|r| r.get("panes").and_then(|p| p.as_array()).cloned())
-        .unwrap_or_else(|| {
-            Command::new(herdr_bin())
-                .args(["pane", "list"])
-                .output()
-                .ok()
-                .and_then(|o| serde_json::from_str(&String::from_utf8_lossy(&o.stdout)).ok())
-                .and_then(|v: serde_json::Value| {
-                    v.pointer("/result/panes").and_then(|p| p.as_array()).cloned()
-                })
-                .unwrap_or_default()
-        })
-}
-
-/// Layout snapshot over the socket (verified /layout envelope); CLI fallback
-/// for socket-less dev runs. Resize paths are bounded and rare; only the
-/// steady-state loops needed socket-first for spawn hygiene.
-fn layout_doc(pane_id: &str) -> Option<serde_json::Value> {
-    if let Ok(v) = crate::ipc::call("pane.layout", serde_json::json!({})) {
-        if v.pointer("/layout/panes").and_then(|p| p.as_array()).is_some() {
-            return Some(v);
-        }
-    }
-    let mut args = vec!["pane", "layout"];
-    let id;
-    if !pane_id.is_empty() {
-        id = pane_id.to_owned();
-        args.extend_from_slice(&["--pane", &id]);
-    }
-    Command::new(herdr_bin())
-        .args(&args)
-        .output()
-        .ok()
-        .and_then(|o| serde_json::from_slice(&o.stdout).ok())
-}
-
-/// Resize over the socket; true when Herdr accepted it.
-fn resize_pane(pane_id: &str, dir: &str, amount: f64) -> bool {
-    let mut params = serde_json::json!({ "direction": dir, "amount": amount });
-    if !pane_id.is_empty() {
-        params["pane_id"] = serde_json::Value::String(pane_id.to_owned());
-    }
-    if crate::ipc::call("pane.resize", params).is_ok() {
-        return true;
-    }
-    let amount_s = format!("{amount:.2}");
-    let mut args: Vec<&str> = vec!["pane", "resize", "--direction", dir, "--amount", &amount_s];
-    let id;
-    if !pane_id.is_empty() {
-        id = pane_id.to_owned();
-        args.extend_from_slice(&["--pane", &id]);
-    } else {
-        args.extend_from_slice(&["--current"]);
-    }
-    Command::new(herdr_bin()).args(&args).output().is_ok()
-}
-
-fn resize_to_target(pane_id: &str, target_width: u16) {
-    if !is_flag_safe(pane_id) {
-        return;
-    }
-    for attempt in 0..6 {
-        thread::sleep(Duration::from_millis(50 + attempt * 30));
-        let Some(v) = layout_doc(pane_id) else { continue; };
-        let Some(panes) = v
-            .pointer("/layout/panes")
-            .or_else(|| v.pointer("/result/layout/panes"))
-            .and_then(|p| p.as_array()) else { continue; };
-        let Some(dock_p) = panes.iter().find(|p| p.get("pane_id").and_then(|x| x.as_str()) == Some(pane_id)) else { continue; };
-        let current_w = dock_p.pointer("/rect/width").and_then(|w| w.as_f64()).unwrap_or(0.0);
-        let x = dock_p.pointer("/rect/x").and_then(|x| x.as_i64()).unwrap_or(0);
-        let area_w = v
-            .pointer("/layout/area/width")
-            .or_else(|| v.pointer("/result/layout/area/width"))
-            .and_then(|w| w.as_f64())
-            .unwrap_or(120.0);
-        let is_right = x > 0;
-
-        let target_w = f64::from(target_width.clamp(24, 80));
-        let diff = current_w - target_w;
-        if diff.abs() < 2.0 || area_w <= 40.0 {
-            return;
-        }
-        let amount = (diff.abs() / area_w).clamp(0.01, 0.45);
-        let dir = if is_right {
-            if diff > 0.0 { "right" } else { "left" }
-        } else {
-            if diff > 0.0 { "left" } else { "right" }
-        };
-        resize_pane(pane_id, dir, amount);
-        // Loop re-reads and converges; the diff check above returns once close.
-    }
-}
-
-/// Open the dock split, then move it to the configured edge: a right split
-/// lands in place, a left dock needs one swap into the left slot.
-/// Summon the singular dock into this tab: close it wherever it lives now,
-/// then open fresh here. pane.move destroys plugin panes (verified live), so
-/// close+open is the only transport.
-fn summon_dock(target_tab: &str, target_pane_id: &str, settings: &crate::config::Settings) {
-    for stray in pane_list()
-        .iter()
-        .filter(|p| {
-            p.get("label").and_then(|x| x.as_str()) == Some(PANE_TITLE)
-                && p.get("tab_id").and_then(|x| x.as_str()) != Some(target_tab)
-        })
-        .filter_map(|p| p.get("pane_id").and_then(|x| x.as_str()))
-    {
-        close_pane(stray);
-    }
-    open_dock(target_pane_id, true, settings.width, settings.dock_right);
-}
-
-fn open_dock(target_pane_id: &str, focus: bool, width: u16, dock_right: bool) {
-    // Socket first: same daemon, no spawn. Both envelopes tried; the CLI
-    // fallback below covers socket-less dev runs.
-    let mut params = serde_json::json!({
-        "plugin_id": "herdr-project-sidebar",
-        "entrypoint": "projects",
-        "placement": "split",
-        "direction": "right",
-        "focus": focus,
-    });
-    if !target_pane_id.is_empty() {
-        params["target_pane_id"] = serde_json::Value::String(target_pane_id.to_owned());
-    }
-    let socket_id = crate::ipc::call("plugin.pane.open", params)
-        .ok()
-        .and_then(|v| {
-            v.pointer("/plugin_pane/pane/pane_id")
-                .or_else(|| v.pointer("/pane/pane_id"))
-                .and_then(|x| x.as_str())
-                .map(str::to_owned)
-        });
-    let mut args = vec![
-        "plugin", "pane", "open",
-        "--plugin", "herdr-project-sidebar",
-        "--entrypoint", "projects",
-        "--placement", "split",
-        "--direction", "right",
-        if focus { "--focus" } else { "--no-focus" },
-    ];
-    if !target_pane_id.is_empty() {
-        args.extend_from_slice(&["--target-pane", target_pane_id]);
-    }
-    let new_id = match socket_id {
-        Some(id) => id,
-        None => {
-            let Ok(out) = Command::new(herdr_bin()).args(&args).output() else { return; };
-            let Ok(val) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else { return; };
-            let Some(id) = val.pointer("/result/plugin_pane/pane/pane_id").and_then(|x| x.as_str()) else { return; };
-            id.to_owned()
-        }
-    };
-    if !dock_right {
-        let _ = Command::new(herdr_bin())
-            .args(["pane", "swap", "--direction", "left", "--pane", &new_id])
-            .output();
-    }
-    resize_to_target(&new_id, width);
-}
-
-/// Liveness verdict from one non-blocking probe: success without a shell
-/// pid is dead; transport failure assumes alive (fail open) and defers to
-/// the next ensure. Killing a healthy dock on a hiccup is the open/close
-/// twitch, so only positive absence REPLACEes.
-fn alive_verdict(call: &io::Result<serde_json::Value>) -> bool {
-    match call {
-        Ok(r) => r
-            .pointer("/process_info/shell_pid")
-            .and_then(|p| p.as_u64())
-            .is_some(),
-        Err(_) => true,
-    }
-}
-
-/// A listed dock pane whose process is gone blocks autoload (present but
-/// dead): REPLACE it, never trust it. Newborn panes already carry their
-/// process (verified live from +0.0s), so no starting grace is needed here.
-fn pane_alive(pane_id: &str) -> bool {
-    if !is_flag_safe(pane_id) {
-        return false;
-    }
-    alive_verdict(&crate::ipc::call(
-        "pane.process_info",
-        serde_json::json!({ "pane_id": pane_id }),
-    ))
-}
-
-fn close_pane(pane_id: &str) {
-    if !is_flag_safe(pane_id) {
-        return;
-    }
-    if crate::ipc::call("pane.close", serde_json::json!({ "pane_id": pane_id })).is_ok() {
-        return;
-    }
-    let _ = Command::new(herdr_bin()).args(["plugin", "pane", "close", pane_id]).output();
-}
-
-/// Move every open dock pane to the newly configured edge, in place: the
-/// dock process survives (unlike close+reopen), width is unchanged, and the
-/// move is a no-op for panes already on the right side.
-pub fn migrate_open_docks(dock_right: bool, width: u16) {
-    let Ok(list) = Command::new(herdr_bin()).args(["pane", "list"]).output() else { return; };
-    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&list.stdout)).unwrap_or_default();
-    let panes = v.pointer("/result/panes").and_then(|p| p.as_array()).cloned().unwrap_or_default();
-    for pane in &panes {
-        if pane.get("label").and_then(|x| x.as_str()) != Some(PANE_TITLE) { continue; }
-        let Some(id) = pane.get("pane_id").and_then(|x| x.as_str()) else { continue; };
-        if !is_flag_safe(id) { continue; }
-        let Some(lv) = layout_doc(id) else { continue; };
-        let Some(rects) = lv
-            .pointer("/layout/panes")
-            .or_else(|| lv.pointer("/result/layout/panes"))
-            .and_then(|p| p.as_array()) else { continue; };
-        let is_right = rects.iter()
-            .find(|p| p.get("pane_id").and_then(|x| x.as_str()) == Some(id))
-            .and_then(|p| p.pointer("/rect/x"))
-            .and_then(|x| x.as_i64())
-            .is_some_and(|x| x > 0);
-        if is_right != dock_right {
-            let _ = Command::new(herdr_bin())
-                .args(["pane", "swap", "--direction", if dock_right { "right" } else { "left" }, "--pane", id])
-                .output();
-            resize_to_target(id, width);
-        }
-    }
-}
-
-fn run_launcher(toggle: bool) -> io::Result<()> {
-    // Focus storms (tab+pane+workspace fire together): contention drops the
-    // event silently. Safe because every run below decides idempotently from
-    // current Herdr truth -- a burst peer re-evaluates milliseconds later.
-    let Some(_lock) = LaunchLock::try_acquire() else {
-        return Ok(());
-    };
-
-    // Socket first: hooks fire per focus event and must not spawn.
-    let mut panes = pane_list();
-
-    let event_json = std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default();
-    let event_data: serde_json::Value = serde_json::from_str(&event_json).unwrap_or_default();
-    let event_payload = event_data.get("data").unwrap_or(&event_data);
-    // The focus event can beat Herdr's own pane list (brand-new panes/tabs):
-    // when the event's pane is missing, re-list once before resolving, or
-    // the workspace fallback aims at the oldest tab (which already has a
-    // dock) and the new tab never grows one.
-    if let Some(ep) = event_payload.get("pane_id").and_then(|x| x.as_str()) {
-        let known = panes.iter().any(|p| p.get("pane_id").and_then(|x| x.as_str()) == Some(ep));
-        if !known {
-            thread::sleep(Duration::from_millis(500));
-            panes = pane_list();
-        }
-    }
-
-    let event_pane = event_payload.get("pane_id").and_then(|x| x.as_str());
-    let tab_from_pane = event_pane.and_then(|id| {
-        panes.iter()
-            .find(|p| p.get("pane_id").and_then(|x| x.as_str()) == Some(id))
-            .and_then(|p| p.get("tab_id").and_then(|x| x.as_str()))
-    });
-    let event_tab = event_payload.get("tab_id").and_then(|x| x.as_str())
-        .or_else(|| event_payload.get("tab").and_then(|t| t.get("tab_id")).and_then(|x| x.as_str()))
-        .or(tab_from_pane);
-    let event_ws = event_payload.get("workspace_id").and_then(|x| x.as_str())
-        .or_else(|| event_payload.get("workspace").and_then(|w| w.get("workspace_id")).and_then(|x| x.as_str()))
-        .or_else(|| event_pane.and_then(|id| {
-            panes.iter()
-                .find(|p| p.get("pane_id").and_then(|x| x.as_str()) == Some(id))
-                .and_then(|p| p.get("workspace_id").and_then(|x| x.as_str()))
-        }));
-
-    let target_tab = if let Some(t) = event_tab {
-        t.to_string()
-    } else if let Some(ws) = event_ws {
-        // Native anchor: the workspace's own active tab, never the oldest
-        // pane's tab (which already has a dock while the new tab starves).
-        // Falls back to focused-in-space, then any pane in the space.
-        let active_tab: Option<String> = (|| {
-            let r = crate::ipc::call("workspace.list", serde_json::json!({})).ok()?;
-            r.get("workspaces")?.as_array()?.iter().find_map(|w| {
-                if w.get("workspace_id").and_then(|x| x.as_str()) == Some(ws) {
-                    w.get("active_tab_id")
-                        .and_then(|x| x.as_str())
-                        .filter(|t| !t.is_empty())
-                        .map(str::to_owned)
-                } else {
-                    None
-                }
-            })
-        })();
-        active_tab.unwrap_or_else(|| {
-            let in_ws = |p: &serde_json::Value| {
-                p.get("workspace_id").and_then(|x| x.as_str()) == Some(ws)
-                    && p.get("label").and_then(|x| x.as_str()) != Some(PANE_TITLE)
-            };
-            panes
-                .iter()
-                .find(|p| {
-                    in_ws(p) && p.get("focused").and_then(|x| x.as_bool()).unwrap_or(false)
-                })
-                .or_else(|| panes.iter().find(|p| in_ws(p)))
-                .and_then(|p| p.get("tab_id").and_then(|x| x.as_str()))
-                .unwrap_or("")
-                .to_string()
-        })
-    } else {
-        panes.iter()
-            .find(|p| p.get("focused").and_then(|x| x.as_bool()).unwrap_or(false))
-            .and_then(|p| p.get("tab_id").and_then(|x| x.as_str()))
-            .unwrap_or("")
-            .to_string()
-    };
-
-    let target_pane_id = panes.iter()
-        .find(|p| p.get("tab_id").and_then(|x| x.as_str()) == Some(&target_tab)
-            && p.get("label").and_then(|x| x.as_str()) != Some(PANE_TITLE))
-        .and_then(|p| p.get("pane_id").and_then(|x| x.as_str()))
-        .unwrap_or("")
-        .to_string();
-
-    let mut mem = Memory::default();
-    load_state(&mut mem);
-    let settings = crate::config::load().unwrap_or_default();
-
-    let existing_docks: Vec<String> = panes.iter()
-        .filter(|p| p.get("label").and_then(|x| x.as_str()) == Some(PANE_TITLE))
-        .filter(|p| p.get("tab_id").and_then(|x| x.as_str()) == Some(&target_tab))
-        .filter_map(|p| p.get("pane_id").and_then(|x| x.as_str()).map(|s| s.to_string()))
-        .collect();
-
-    let has_dock_in_current_tab = panes.iter().any(|p| {
-        p.get("label").and_then(|x| x.as_str()) == Some(PANE_TITLE)
-            && p.get("tab_id").and_then(|x| x.as_str()) == Some(&target_tab)
-    });
-
-    if toggle {
-        if has_dock_in_current_tab {
-            for id in &existing_docks {
-                close_pane(id);
-            }
-            snooze_set(&snooze_dir(), &target_tab);
-        } else {
-            for id in &existing_docks {
-                close_pane(id);
-            }
-            snooze_clear(&snooze_dir(), &target_tab);
-            summon_dock(&target_tab, &target_pane_id, &settings);
-        }
-        mem.dirty_state = true;
-        save_state(&mut mem, true);
-    } else {
-        // Autoload switch (settings, default on) plus per-tab snooze: closing
-        // one tab never disables the rest.
-        if !settings.auto_open {
-            return Ok(());
-        }
-        if target_tab.is_empty() {
-            return Ok(());
-        }
-        let sdir = snooze_dir();
-        snooze_sweep(
-            &sdir,
-            &panes
-                .iter()
-                .filter_map(|p| p.get("tab_id").and_then(|x| x.as_str()).map(str::to_owned))
-                .collect(),
-        );
-        if snooze_is_set(&sdir, &target_tab) {
-            return Ok(());
-        }
-        let _ = mem;
-        // The focus event can precede Herdr's own state commit: re-list once
-        // before giving up, or fresh tabs never grow a dock. open_dock places
-        // anchorless when no sibling pane resolves yet.
-        let mut target_pane_id = target_pane_id;
-        if target_pane_id.is_empty() && !target_tab.is_empty() {
-            thread::sleep(Duration::from_millis(500));
-            panes = pane_list();
-            target_pane_id = panes.iter()
-                .find(|p| p.get("tab_id").and_then(|x| x.as_str()) == Some(&target_tab)
-                    && p.get("label").and_then(|x| x.as_str()) != Some(PANE_TITLE))
-                .and_then(|p| p.get("pane_id").and_then(|x| x.as_str()))
-                .unwrap_or("")
-                .to_string();
-        }
-        if target_tab.is_empty() {
-            return Ok(());
-        }
-        // Singular dock: exactly one Projects pane session-wide, following
-        // focus. Strays elsewhere close before opening here; dead panes
-        // (process gone) are REPLACEd: a corpse must never block the dock.
-        let mut live_in_tab = false;
-        for pane in panes
-            .iter()
-            .filter(|p| {
-                p.get("label").and_then(|x| x.as_str()) == Some(PANE_TITLE)
-                    && p.get("tab_id").and_then(|x| x.as_str()) == Some(&target_tab)
-            })
-            .filter_map(|p| p.get("pane_id").and_then(|x| x.as_str()))
-        {
-            if pane_alive(pane) {
-                live_in_tab = true;
-            } else {
-                close_pane(pane);
-            }
-        }
-        if !live_in_tab {
-            // Follow-me: close strays in other tabs, then open here.
-            for stray in panes
-                .iter()
-                .filter(|p| {
-                    p.get("label").and_then(|x| x.as_str()) == Some(PANE_TITLE)
-                        && p.get("tab_id").and_then(|x| x.as_str()) != Some(&target_tab)
-                })
-                .filter_map(|p| p.get("pane_id").and_then(|x| x.as_str()))
-            {
-                close_pane(stray);
-            }
-            open_dock(&target_pane_id, false, settings.width, settings.dock_right);
-        }
-    }
-    Ok(())
-}
-
-/// Focus a session exactly like the native sidebar: one `agent focus` call.
-/// The old workspace+tab+agent chain tripled focus events (ensure stampedes,
-/// visible flicker); the daemon resolves tab and space from the session.
-/// Socket first, CLI fallback for socket-less dev runs.
-fn focus_session(pane_id: &str) {
-    if !is_flag_safe(pane_id) {
-        return;
-    }
-    if crate::ipc::call("agent.focus", serde_json::json!({ "target": pane_id })).is_ok() {
-        return;
-    }
-    let _ = Command::new(herdr_bin()).args(["agent", "focus", pane_id]).output();
-}
-
-/// Click generation: rapid clicks must not pile up competing focus threads.
-/// Only the newest generation may fire; stale ones abort before each step.
-static CLICK_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Is our own pane focused right now? Repeat clicks (dock already focused)
-/// carry no click-focus race and fire immediately.
-fn dock_focused_now() -> bool {
-    let my = std::env::var("HERDR_PANE_ID").unwrap_or_default();
-    if my.is_empty() {
-        return false;
-    }
-    crate::ipc::call("session.snapshot", serde_json::json!({}))
-        .ok()
-        .and_then(|r| {
-            r.get("snapshot")?
-                .get("focused_pane_id")?
-                .as_str()
-                .map(str::to_owned)
-        })
-        .is_some_and(|id| id == my)
-}
-
-fn focused_pane_now() -> Option<String> {
-    crate::ipc::call("session.snapshot", serde_json::json!({}))
-        .ok()
-        .and_then(|r| {
-            r.get("snapshot")?
-                .get("focused_pane_id")?
-                .as_str()
-                .map(str::to_owned)
-        })
-}
-
-/// Mouse-click activation: Herdr focuses the clicked (dock) pane on mouse
-/// Down *after* delivering the event, so an immediate focus call races the
-/// click-focus and loses. First click waits out dispatch; repeat clicks (no
-/// new click-focus coming) fire at once. Verify the landing, retry twice.
-/// Keyboard Enter needs none of this (no click-focus precedes it).
-fn focus_session_deferred(pane_id: String) {
-    let gen = CLICK_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-    let live = |g: u64| CLICK_GEN.load(std::sync::atomic::Ordering::SeqCst) == g;
-    std::thread::spawn(move || {
-        if !dock_focused_now() {
-            std::thread::sleep(Duration::from_millis(300));
-        }
-        for _ in 0..3 {
-            if !live(gen) {
-                return;
-            }
-            focus_session(&pane_id);
-            std::thread::sleep(Duration::from_millis(500));
-            if !live(gen) {
-                return;
-            }
-            if focused_pane_now().is_some_and(|id| id == pane_id) {
-                return;
-            }
-        }
-    });
-}
-
-/// Same race on header/worktree clicks (space focus, no landing to verify).
-fn focus_workspace_deferred(workspace_id: String) {
-    let gen = CLICK_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-    let already = dock_focused_now();
-    std::thread::spawn(move || {
-        if !already {
-            std::thread::sleep(Duration::from_millis(300));
-        }
-        if CLICK_GEN.load(std::sync::atomic::Ordering::SeqCst) == gen {
-            let _ = focus_workspace(&workspace_id);
-        }
-    });
-}
-
-fn resize_dock(wider: bool) {
-    let pane_id = std::env::var("HERDR_PANE_ID").unwrap_or_default();
-    let is_left = layout_doc(&pane_id)
-        .and_then(|v| {
-            let panes = v
-                .pointer("/layout/panes")
-                .or_else(|| v.pointer("/result/layout/panes"))?
-                .as_array()?;
-            let target = if !pane_id.is_empty() {
-                panes.iter().find(|p| p.get("pane_id").and_then(|x| x.as_str()) == Some(&pane_id))
-            } else {
-                panes.iter().find(|p| p.get("label").and_then(|x| x.as_str()) == Some("Projects"))
-            };
-            let x = target.and_then(|p| p.pointer("/rect/x"))?.as_i64()?;
-            Some(x == 0)
-        })
-        .unwrap_or(false);
-
-    let dir = if is_left {
-        if wider { "right" } else { "left" }
-    } else {
-        if wider { "left" } else { "right" }
-    };
-    resize_pane(if is_flag_safe(&pane_id) { &pane_id } else { "" }, dir, 0.04);
-}
-fn is_dock_right() -> bool {
-    let pane_id = std::env::var("HERDR_PANE_ID").unwrap_or_default();
-    // Socket first (verified shape /layout/panes), CLI fallback for dev runs.
-    let Some(v) = layout_doc("") else { return true; };
-    let Some(panes) = v
-        .pointer("/layout/panes")
-        .or_else(|| v.pointer("/result/layout/panes"))
-        .and_then(|p| p.as_array()) else { return true; };
-    let target = if !pane_id.is_empty() {
-        panes.iter().find(|p| p.get("pane_id").and_then(|x| x.as_str()) == Some(&pane_id))
-    } else {
-        panes.iter().find(|p| p.get("label").and_then(|x| x.as_str()) == Some(PANE_TITLE))
-    };
-    let x = target.and_then(|p| p.pointer("/rect/x")).and_then(|v| v.as_i64()).unwrap_or(1);
-    x > 0
-}
-
-/// Layout side, cached: the footer draws every spinner frame, so a query per
-/// frame is a per-frame spawn. Side moves only via our own migrate/resize, at
-/// most seconds stale either way.
-fn dock_side(side: &mut Option<(bool, std::time::Instant)>) -> bool {
-    if let Some((s, t)) = side {
-        if t.elapsed() < SIDE_TTL {
-            return *s;
-        }
-    }
-    let s = is_dock_right();
-    *side = Some((s, std::time::Instant::now()));
-    s
-}
-
-
 
 // ---------- Tree ----------
 
@@ -2046,9 +1401,9 @@ fn matches_filter(p: &Project, query: &str) -> bool {
     p.worktrees.iter().any(|w| {
         w.name.to_lowercase().contains(&q)
             || w.branch.to_lowercase().contains(&q)
-            || w.agents.iter().any(|a| {
-                a.title.to_lowercase().contains(&q) || a.label.to_lowercase().contains(&q)
-            })
+            || w.agents
+                .iter()
+                .any(|a| a.title.to_lowercase().contains(&q) || a.label.to_lowercase().contains(&q))
     })
 }
 
@@ -2182,7 +1537,9 @@ fn modal_hit(
     more: ratatui::layout::Rect,
     rows: &[ratatui::layout::Rect; 10],
 ) -> Option<ModalHit> {
-    let at = |r: ratatui::layout::Rect| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height;
+    let at = |r: ratatui::layout::Rect| {
+        col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+    };
     if at(close) {
         Some(ModalHit::Close)
     } else if at(less) {
@@ -2292,29 +1649,8 @@ impl Drop for TermGuard {
     }
 }
 
-pub fn toggle() -> io::Result<()> {
-    run_launcher(true)
-}
-
-pub fn ensure() -> io::Result<()> {
-    run_launcher(false)
-}
-
 pub fn run() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--toggle") {
-        return toggle();
-    }
-    if args.iter().any(|a| a == "--ensure") {
-        return ensure();
-    }
-    if args.iter().any(|a| a == "--launch-decision") {
-        let mut input = String::new();
-        use std::io::Read;
-        let _ = std::io::stdin().read_to_string(&mut input);
-        println!("{}", launch_decision(&input, ""));
-        return Ok(());
-    }
     if args.iter().any(|a| a == "--dump-snapshot") {
         let mut mem = Memory::default();
         load_state(&mut mem);
@@ -2339,16 +1675,15 @@ pub fn run() -> io::Result<()> {
                 })
             })
             .collect();
-        println!("{}", serde_json::json!({"projects": dump, "rows": rows.len(), "error": err}));
+        println!(
+            "{}",
+            serde_json::json!({"projects": dump, "rows": rows.len(), "error": err})
+        );
         return Ok(());
     }
 
     let mut mem = Memory::default();
     load_state(&mut mem);
-    let settings = crate::config::load().unwrap_or_default();
-    if let Ok(my_pane_id) = std::env::var("HERDR_PANE_ID") {
-        resize_to_target(&my_pane_id, settings.width);
-    }
     // Glyph set: explicit choice wins, auto detects once. The notice below
     // is the install prompt: it explains what the font is for and remembers.
     let mut font_detected = font_ok();
@@ -2368,14 +1703,9 @@ pub fn run() -> io::Result<()> {
     let mut theme = load_theme();
     let (mut projects, mut sync_error) = snapshot(&mut mem, &theme.projects, font);
     let mut last_snapshot = std::time::Instant::now();
-    let mut last_focused_pane: Option<String>;
-    let mut last_space: Option<String>;
     let mut selected = 0usize;
-    let mut last_input: Option<std::time::Instant> = None;
-    let mut side_cache: Option<(bool, std::time::Instant)> = None;
-    // No detach: the cursor seats with Herdr focus every refresh, in the same
-    // frame as the underline. Browse other projects via filter (which holds
-    // the seat still); the fill never sits outside the active space.
+    let mut browsing = false;
+    let mut pressed: Option<((u8, String), Activation)> = None;
     let mut offset = 0usize;
     let mut tick = 0usize;
     let mut hover: Option<usize> = None;
@@ -2397,7 +1727,12 @@ pub fn run() -> io::Result<()> {
     }));
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, SetTitle(PANE_TITLE))?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        SetTitle(PANE_TITLE)
+    )?;
     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
     // RAII: every `?` below returns through this drop, so an I/O error can
     // never leave raw mode + alternate screen + mouse capture armed. (Panics
@@ -2406,57 +1741,47 @@ pub fn run() -> io::Result<()> {
     // First frame seats before the loop: otherwise the underline (rendered
     // from the initial snapshot) leads the cursor by a full poll interval.
     {
-        last_focused_pane = projects
+        let focused_pane = projects
             .iter()
             .flat_map(|p| p.worktrees.iter())
             .flat_map(|w| w.agents.iter())
             .find(|a| a.focused)
             .map(|a| a.pane_id.clone());
-        last_space = projects.iter().find(|p| p.focused).map(|p| p.id.clone());
         let rows = visible(&projects, &query, compact, view);
-        if let Some(idx) = seat_row(&projects, &rows, last_focused_pane.as_deref()) {
+        if let Some(idx) = seat_row(&projects, &rows, focused_pane.as_deref()) {
             selected = idx;
         }
     }
     loop {
-        // Refresh at most 1/sec; theme re-read rides along so light/dark
-        // follows config edits without a restart.
+        // Preserve browsing identity when native activity reorders rows.
         if last_snapshot.elapsed() >= SNAPSHOT_MIN_AGE {
+            let previous_rows = visible(&projects, &query, compact, view);
+            let selected_key = row_key(&projects, &previous_rows, selected)
+                .map(|(kind, id)| (kind, id.to_owned()));
+            if !settings_dialog {
+                settings_obj = crate::config::load()?;
+            }
             theme = load_theme();
             let (fresh, err) = snapshot(&mut mem, &theme.projects, font);
-            let current_focused = fresh.iter()
+            let current_focused = fresh
+                .iter()
                 .flat_map(|p| p.worktrees.iter())
                 .flat_map(|w| w.agents.iter())
                 .find(|a| a.focused)
                 .map(|a| a.pane_id.clone());
             projects = fresh;
             sync_error = err;
-            // Agent focus alone misses space hops that land on plain panes
-            // (dock itself, bare shell): None -> None, cursor stuck. The
-            // focused space is the backstop.
-            let current_space = projects.iter().find(|p| p.focused).map(|p| p.id.clone());
-            let moved = current_focused != last_focused_pane || current_space != last_space;
-            if moved {
-                // Focus moved elsewhere: drop a parked hover with it, or the
-                // old row keeps its fill next to the newly selected one.
-                hover = None;
-                last_focused_pane = current_focused.clone();
-                last_space = current_space;
-            }
-            // Bulk seat: cursor and underline move in the same frame, straight
-            // from Herdr state. Manual navigation holds the seat for a drive
-            // window; dialogs and filtering hold it while driving.
-            // Hands on the wheel (recent input, no external move): leave
-            // the cursor alone so arrow/j/k browsing and Enter can land.
-            let driving = !moved && last_input.is_some_and(|t| t.elapsed() < DRIVE_HOLD);
-            if !driving && !filtering && !settings_dialog && confirm_close.is_none() {
-                let current_rows = visible(&projects, &query, compact, view);
-                if let Some(row_idx) = seat_row(&projects, &current_rows, current_focused.as_deref()) {
-                    selected = row_idx;
-                    let h = term.size().map(|s| s.height.saturating_sub(2) as usize).unwrap_or(24);
-                    offset = ensure_visible(selected, offset, h);
-                }
-            }
+            let current_rows = visible(&projects, &query, compact, view);
+            let preserved = selected_key
+                .as_ref()
+                .and_then(|(kind, id)| row_index(&projects, &current_rows, (*kind, id.as_str())));
+            selected = if browsing || filtering || settings_dialog || confirm_close.is_some() {
+                preserved.unwrap_or(selected.min(current_rows.len().saturating_sub(1)))
+            } else {
+                seat_row(&projects, &current_rows, current_focused.as_deref())
+                    .or(preserved)
+                    .unwrap_or(0)
+            };
             last_snapshot = std::time::Instant::now();
         }
         save_state(&mut mem, false);
@@ -2467,8 +1792,7 @@ pub fn run() -> io::Result<()> {
         let height = term.size()?.height.saturating_sub(2) as usize;
         // Clamp the window itself: when rows shrink under a high offset the
         // viewport would otherwise anchor on the last row and draw blanks.
-        offset = ensure_visible(selected, offset, height)
-            .min(rows.len().saturating_sub(height));
+        offset = ensure_visible(selected, offset, height).min(rows.len().saturating_sub(height));
         let working = rows.iter().any(|r| match *r {
             Row::Agent(pi, wi, ai) => {
                 let (g, anim) = state_glyph(projects[pi].worktrees[wi].agents[ai].state, 0, font);
@@ -2529,11 +1853,17 @@ pub fn run() -> io::Result<()> {
                         let p = &projects[pi];
                         let mark = if p.collapsed { "▸" } else { "▾" };
                         // Nerd pin by codepoint (no literal: survives any transport); ASCII star fallback.
-                        let pin = if p.pinned { pin_mark(font).to_string() } else { String::new() };
+                        let pin = if p.pinned {
+                            pin_mark(font).to_string()
+                        } else {
+                            String::new()
+                        };
                         Line::from(vec![
                             Span::styled(
                                 format!("{} {} ", p.icon, mark),
-                                Style::default().fg(p.icon_color).add_modifier(Modifier::BOLD),
+                                Style::default()
+                                    .fg(p.icon_color)
+                                    .add_modifier(Modifier::BOLD),
                             ),
                             Span::styled(
                                 format!("{}{} ", p.name, pin),
@@ -2596,7 +1926,9 @@ pub fn run() -> io::Result<()> {
                         let title_style = if a.state == State::Working {
                             Style::default().fg(v_color).add_modifier(Modifier::BOLD)
                         } else if a.state == State::IdleStale {
-                            Style::default().fg(theme.idle_stale).add_modifier(Modifier::DIM)
+                            Style::default()
+                                .fg(theme.idle_stale)
+                                .add_modifier(Modifier::DIM)
                         } else {
                             Style::default().fg(state_color(&theme, a.state))
                         };
@@ -2610,7 +1942,10 @@ pub fn run() -> io::Result<()> {
                                     .add_modifier(Modifier::BOLD),
                             ),
                             Span::raw(" "),
-                            Span::styled(format!("{logo} {}", a.label), Style::default().fg(v_color)),
+                            Span::styled(
+                                format!("{logo} {}", a.label),
+                                Style::default().fg(v_color),
+                            ),
                             Span::raw(" · "),
                             Span::styled(&a.title, title_style),
                         ];
@@ -2629,10 +1964,20 @@ pub fn run() -> io::Result<()> {
                     // the selected fill: lift it to the accent while selected.
                     if matches!(rows[idx], Row::Worktree(_, _)) {
                         if let Some(icon) = line.spans.first_mut() {
-                            icon.style = Style::default().fg(theme.working).add_modifier(Modifier::BOLD);
+                            icon.style = Style::default()
+                                .fg(theme.working)
+                                .add_modifier(Modifier::BOLD);
                         }
                     }
-                    line.spans.insert(0, Span::styled("› ", Style::default().fg(theme.working).add_modifier(Modifier::BOLD)));
+                    line.spans.insert(
+                        0,
+                        Span::styled(
+                            "› ",
+                            Style::default()
+                                .fg(theme.working)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    );
                 } else if hover == Some(idx) {
                     line.spans.insert(0, Span::raw("· "));
                 } else if matches!(rows[idx], Row::Agent(pi, wi, ai) if projects[pi].worktrees[wi].agents[ai].focused)
@@ -2640,7 +1985,12 @@ pub fn run() -> io::Result<()> {
                     // Herdr focus, independent of the cursor: survives j/k.
                     line.spans.insert(
                         0,
-                        Span::styled("» ", Style::default().fg(theme.working).add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            "» ",
+                            Style::default()
+                                .fg(theme.working)
+                                .add_modifier(Modifier::BOLD),
+                        ),
                     );
                 } else {
                     line.spans.insert(0, Span::raw("  "));
@@ -2685,8 +2035,7 @@ pub fn run() -> io::Result<()> {
                 f.render_widget(Paragraph::new(dim_lines), content_rect);
 
                 // Footer line
-                let dock_is_right = dock_side(&mut side_cache);
-                let resize_hint = if dock_is_right { "← wider · → narrower" } else { "→ wider · ← narrower" };
+                let resize_hint = "[ / ] width";
                 let bottom = if let Some(e) = sync_error.as_deref() {
                     format!("herdr unreachable: {e} (retrying)")
                 } else if filtering {
@@ -2767,15 +2116,7 @@ pub fn run() -> io::Result<()> {
                     }
                     let help_y = card_rect.y + 2 + (shown as u16) * 2 + 1;
                     if help_y < card_rect.bottom().saturating_sub(2) {
-                        let help_text = if settings_row == 0 {
-                            if dock_is_right {
-                                "Docked right: Left arrow (←/h) moves divider left to GROW width; Right arrow (→/l) moves divider right to SHRINK width (24-80)."
-                            } else {
-                                "Docked left: Right arrow (→/l) moves divider right to GROW width; Left arrow (←/h) moves divider left to SHRINK width (24-80)."
-                            }
-                        } else {
-                            crate::settings::HELP[settings_row]
-                        };
+                        let help_text = crate::settings::HELP[settings_row];
                         f.render_widget(
                             Paragraph::new(help_text).wrap(ratatui::widgets::Wrap { trim: true }).style(Style::default().fg(theme.dim)),
                             ratatui::layout::Rect::new(card_rect.x + 2, help_y, card_rect.width.saturating_sub(4), card_rect.bottom().saturating_sub(help_y + 1)),
@@ -2832,7 +2173,8 @@ pub fn run() -> io::Result<()> {
             continue;
         }
         match event::read()? {
-            Event::Key(key) => {
+            Event::Key(key) if key.kind != crossterm::event::KeyEventKind::Release => {
+                pressed = None;
                 // Fresh key input replaces the previous message (each arm sets
                 // its own); mouse motion/resize must not eat lifecycle
                 status_line.clear();
@@ -2859,7 +2201,10 @@ pub fn run() -> io::Result<()> {
                 }
                 if settings_dialog {
                     match key.code {
-                        KeyCode::Esc | KeyCode::Char('s') | KeyCode::Char('q') | KeyCode::Char('c') => {
+                        KeyCode::Esc
+                        | KeyCode::Char('s')
+                        | KeyCode::Char('q')
+                        | KeyCode::Char('c') => {
                             settings_dialog = false;
                             let _ = crate::config::update(|s| *s = settings_obj.clone());
                         }
@@ -2867,40 +2212,16 @@ pub fn run() -> io::Result<()> {
                             settings_row = settings_row.saturating_sub(1);
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
-                            settings_row = (settings_row + 1).min(crate::settings::LABELS.len().saturating_sub(1));
+                            settings_row = (settings_row + 1)
+                                .min(crate::settings::LABELS.len().saturating_sub(1));
                         }
                         KeyCode::Left | KeyCode::Char('h') => {
-                            if settings_row == 0 {
-                                if dock_side(&mut side_cache) {
-                                    settings_obj.width = settings_obj.width.saturating_add(2).min(80);
-                                    resize_dock(true);
-                                } else {
-                                    settings_obj.width = settings_obj.width.saturating_sub(2).max(24);
-                                    resize_dock(false);
-                                }
-                                crate::settings::change(&mut settings_obj, settings_row, false);
-                                if settings_row == 1 {
-                                    migrate_open_docks(settings_obj.dock_right, settings_obj.width);
-                                }
-                            }
-                            let _ = crate::config::update(|s| *s = settings_obj.clone());
+                            crate::settings::change(&mut settings_obj, settings_row, false);
+                            crate::config::update(|s| *s = settings_obj.clone())?;
                         }
                         KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
-                            if settings_row == 0 {
-                                if dock_side(&mut side_cache) {
-                                    settings_obj.width = settings_obj.width.saturating_sub(2).max(24);
-                                    resize_dock(false);
-                                } else {
-                                    settings_obj.width = settings_obj.width.saturating_add(2).min(80);
-                                    resize_dock(true);
-                                }
-                            } else {
-                                crate::settings::change(&mut settings_obj, settings_row, true);
-                                if settings_row == 1 {
-                                    migrate_open_docks(settings_obj.dock_right, settings_obj.width);
-                                }
-                            }
-                            let _ = crate::config::update(|s| *s = settings_obj.clone());
+                            crate::settings::change(&mut settings_obj, settings_row, true);
+                            crate::config::update(|s| *s = settings_obj.clone())?;
                         }
                         _ => {}
                     }
@@ -2926,6 +2247,7 @@ pub fn run() -> io::Result<()> {
                             font_dialog = false;
                             status_line = "ASCII icons, won't ask again".into();
                             mem.dirty_state = true;
+                            save_state(&mut mem, true);
                         }
                         KeyCode::Char('3') => {
                             mem.font_choice = "font".into();
@@ -2934,6 +2256,7 @@ pub fn run() -> io::Result<()> {
                             font_dialog = false;
                             status_line = "Nerd Font assumed".into();
                             mem.dirty_state = true;
+                            save_state(&mut mem, true);
                         }
                         KeyCode::Esc => font_dialog = false,
                         _ => {}
@@ -2948,24 +2271,27 @@ pub fn run() -> io::Result<()> {
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     KeyCode::Enter => {
                         if selected < rows.len() {
-                            activate(&projects, &rows, selected);
+                            browsing = false;
+                            if let Err(error) = activate(&projects, &rows, selected) {
+                                status_line = error.to_string();
+                            }
                         }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         selected = (selected + 1).min(rows.len().saturating_sub(1));
-                        last_input = Some(std::time::Instant::now());
-                                            }
+                        browsing = true;
+                    }
                     KeyCode::Up | KeyCode::Char('k') => {
                         selected = selected.saturating_sub(1);
-                        last_input = Some(std::time::Instant::now());
-                                            }
+                        browsing = true;
+                    }
                     KeyCode::Left | KeyCode::Char('h') => {
                         fold_at(&mut projects, &mut mem, &rows, selected, true);
-                        last_input = Some(std::time::Instant::now());
+                        browsing = true;
                     }
                     KeyCode::Right | KeyCode::Char('l') => {
                         fold_at(&mut projects, &mut mem, &rows, selected, false);
-                        last_input = Some(std::time::Instant::now());
+                        browsing = true;
                     }
                     KeyCode::Char('/') => {
                         filtering = true;
@@ -2974,7 +2300,11 @@ pub fn run() -> io::Result<()> {
                         offset = 0;
                     }
                     KeyCode::Char('v') => {
-                        view = if view == View::Grouped { View::Recent } else { View::Grouped };
+                        view = if view == View::Grouped {
+                            View::Recent
+                        } else {
+                            View::Grouped
+                        };
                         selected = 0;
                         offset = 0;
                     }
@@ -2985,13 +2315,11 @@ pub fn run() -> io::Result<()> {
                         settings_obj = crate::config::load().unwrap_or_default();
                     }
                     KeyCode::Char('[') | KeyCode::Char('-') => {
-                        resize_dock(false);
                         settings_obj.width = settings_obj.width.saturating_sub(2).max(24);
                         let _ = crate::config::update(|s| s.width = settings_obj.width);
                         status_line = format!("dock width: {}", settings_obj.width);
                     }
                     KeyCode::Char(']') | KeyCode::Char('+') | KeyCode::Char('=') => {
-                        resize_dock(true);
                         settings_obj.width = settings_obj.width.saturating_add(2).min(80);
                         let _ = crate::config::update(|s| s.width = settings_obj.width);
                         status_line = format!("dock width: {}", settings_obj.width);
@@ -3007,12 +2335,10 @@ pub fn run() -> io::Result<()> {
                             _ => false,
                         };
                         if n > 0 {
-                            if let Some(off) =
-                                (1..=n).find(|k| is_att(&rows[(selected + k) % n]))
-                            {
+                            if let Some(off) = (1..=n).find(|k| is_att(&rows[(selected + k) % n])) {
                                 selected = (selected + off) % n;
-                                last_input = Some(std::time::Instant::now());
-                                                            } else {
+                                browsing = true;
+                            } else {
                                 status_line = "no blocked or unacked rows".into();
                             }
                         }
@@ -3076,6 +2402,7 @@ pub fn run() -> io::Result<()> {
                                 projects[pi].pinned = true;
                             }
                             mem.dirty_state = true;
+                            save_state(&mut mem, true);
                         }
                     }
                     KeyCode::Char('D') => {
@@ -3084,9 +2411,15 @@ pub fn run() -> io::Result<()> {
                             // its member spaces, a worktree/agent row its own.
                             let (wss, name, live): (Vec<String>, String, usize) = match *r {
                                 Row::Project(pi) => (
-                                    projects.get(pi).map(|p| p.workspaces.clone()).unwrap_or_default(),
+                                    projects
+                                        .get(pi)
+                                        .map(|p| p.workspaces.clone())
+                                        .unwrap_or_default(),
                                     projects.get(pi).map(|p| p.name.clone()).unwrap_or_default(),
-                                    projects.get(pi).map(|p| p.worktrees.iter().flat_map(|w| &w.agents).count()).unwrap_or(0),
+                                    projects
+                                        .get(pi)
+                                        .map(|p| p.worktrees.iter().flat_map(|w| &w.agents).count())
+                                        .unwrap_or(0),
                                 ),
                                 Row::Agent(pi, wi, ai) => (
                                     projects
@@ -3096,7 +2429,10 @@ pub fn run() -> io::Result<()> {
                                         .map(|a| vec![a.workspace_id.clone()])
                                         .unwrap_or_default(),
                                     projects.get(pi).map(|p| p.name.clone()).unwrap_or_default(),
-                                    projects.get(pi).map(|p| p.worktrees.iter().flat_map(|w| &w.agents).count()).unwrap_or(0),
+                                    projects
+                                        .get(pi)
+                                        .map(|p| p.worktrees.iter().flat_map(|w| &w.agents).count())
+                                        .unwrap_or(0),
                                 ),
                                 Row::Worktree(pi, wi) => (
                                     projects
@@ -3153,19 +2489,18 @@ pub fn run() -> io::Result<()> {
                                 confirm_close = None;
                             } else {
                                 confirm_close = Some(wss);
-                                status_line = format!(
-                                    "press D again to close {name} ({live} agents)"
-                                );
+                                status_line =
+                                    format!("press D again to close {name} ({live} agents)");
                             }
                         }
                     }
                     KeyCode::Char('N') => {
-                        let created =
-                            crate::ipc::call("workspace.create", serde_json::json!({})).is_ok()
-                                || Command::new(herdr_bin())
-                                    .args(["workspace", "create"])
-                                    .output()
-                                    .is_ok_and(|o| o.status.success());
+                        let created = crate::ipc::call("workspace.create", serde_json::json!({}))
+                            .is_ok()
+                            || Command::new(herdr_bin())
+                                .args(["workspace", "create"])
+                                .output()
+                                .is_ok_and(|o| o.status.success());
                         if created {
                             status_line = "workspace created".into();
                             last_snapshot = last_snapshot
@@ -3180,42 +2515,26 @@ pub fn run() -> io::Result<()> {
             }
             Event::Mouse(m) => match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
+                    pressed = None;
                     confirm_close = None;
                     if settings_dialog {
-                        match modal_hit(m.column, m.row, close_btn, less_btn, more_btn, &row_rects) {
+                        match modal_hit(m.column, m.row, close_btn, less_btn, more_btn, &row_rects)
+                        {
                             Some(ModalHit::Close) => {
                                 settings_dialog = false;
                                 let _ = crate::config::update(|s| *s = settings_obj.clone());
                             }
                             Some(ModalHit::Less) => {
-                                if dock_side(&mut side_cache) {
-                                    settings_obj.width = settings_obj.width.saturating_add(2).min(80);
-                                    resize_dock(true);
-                                } else {
-                                    settings_obj.width = settings_obj.width.saturating_sub(2).max(24);
-                                    resize_dock(false);
-                                }
-                                let _ = crate::config::update(|s| *s = settings_obj.clone());
+                                crate::settings::change(&mut settings_obj, 0, false);
+                                crate::config::update(|s| *s = settings_obj.clone())?;
                             }
                             Some(ModalHit::More) => {
-                                if dock_side(&mut side_cache) {
-                                    settings_obj.width = settings_obj.width.saturating_sub(2).max(24);
-                                    resize_dock(false);
-                                } else {
-                                    settings_obj.width = settings_obj.width.saturating_add(2).min(80);
-                                    resize_dock(true);
-                                }
-                                let _ = crate::config::update(|s| *s = settings_obj.clone());
+                                crate::settings::change(&mut settings_obj, 0, true);
+                                crate::config::update(|s| *s = settings_obj.clone())?;
                             }
                             Some(ModalHit::Row(i)) => {
                                 settings_row = i;
                                 crate::settings::change(&mut settings_obj, i, true);
-                                if i == 0 {
-                                    resize_dock(true);
-                                }
-                                if i == 1 {
-                                    migrate_open_docks(settings_obj.dock_right, settings_obj.width);
-                                }
                                 let _ = crate::config::update(|s| *s = settings_obj.clone());
                             }
                             None => {}
@@ -3223,7 +2542,12 @@ pub fn run() -> io::Result<()> {
                         continue;
                     }
 
-                    let contains = |r: ratatui::layout::Rect| m.column >= r.x && m.column < r.x + r.width && m.row >= r.y && m.row < r.y + r.height;
+                    let contains = |r: ratatui::layout::Rect| {
+                        m.column >= r.x
+                            && m.column < r.x + r.width
+                            && m.row >= r.y
+                            && m.row < r.y + r.height
+                    };
                     if contains(settings_btn) {
                         settings_dialog = true;
                         settings_obj = crate::config::load().unwrap_or_default();
@@ -3234,8 +2558,22 @@ pub fn run() -> io::Result<()> {
                         if idx < rows.len() {
                             selected = idx;
                             hover = None;
-                            last_input = Some(std::time::Instant::now());
-                                                        activate_deferred(&projects, &rows, idx);
+                            browsing = true;
+                            pressed = row_key(&projects, &rows, idx)
+                                .map(|(kind, id)| (kind, id.to_owned()))
+                                .zip(activation_target(&projects, &rows, idx));
+                        }
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    if let Some(((kind, id), target)) = pressed.take() {
+                        let released = visual_hit(&visual_rows, m.row)
+                            .and_then(|idx| row_key(&projects, &rows, idx));
+                        if released == Some((kind, id.as_str())) {
+                            browsing = false;
+                            if let Err(error) = activate_target(target) {
+                                status_line = error.to_string();
+                            }
                         }
                     }
                 }
@@ -3247,18 +2585,19 @@ pub fn run() -> io::Result<()> {
                             settings_row = i;
                         }
                     } else {
-                        hover = visual_hit(&visual_rows, m.row)
-                            .filter(|idx| *idx < rows.len());
+                        hover = visual_hit(&visual_rows, m.row).filter(|idx| *idx < rows.len());
                     }
                 }
                 MouseEventKind::ScrollDown => {
                     if settings_dialog {
-                        settings_row = (settings_row + 1).min(crate::settings::LABELS.len().saturating_sub(1));
+                        settings_row =
+                            (settings_row + 1).min(crate::settings::LABELS.len().saturating_sub(1));
                     } else {
                         confirm_close = None;
                         selected = (selected + 3).min(rows.len().saturating_sub(1));
-                        last_input = Some(std::time::Instant::now());
-                                            }
+                        pressed = None;
+                        browsing = true;
+                    }
                 }
                 MouseEventKind::ScrollUp => {
                     if settings_dialog {
@@ -3266,8 +2605,9 @@ pub fn run() -> io::Result<()> {
                     } else {
                         confirm_close = None;
                         selected = selected.saturating_sub(3);
-                        last_input = Some(std::time::Instant::now());
-                                            }
+                        pressed = None;
+                        browsing = true;
+                    }
                 }
                 _ => {}
             },
@@ -3277,31 +2617,20 @@ pub fn run() -> io::Result<()> {
 
     save_state(&mut mem, true);
     disable_raw_mode()?;
-    execute!(term.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
-    Ok(())
+    execute!(
+        term.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    crate::native::dock_command(crate::dock_control::Command::Close)
 }
 
-/// One native-sidebar click: focus the space, nothing else. Herdr cascades
-/// tab and pane; the dock never re-specifies them (that triple-focus storm
-/// is what twinned panes). Socket first for the silent paths, CLI fallback.
-/// The `o` key needs the outcome, so this reports it.
 fn focus_workspace(workspace_id: &str) -> io::Result<()> {
-    if !is_flag_safe(workspace_id) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad workspace id"));
-    }
-    if crate::ipc::call(
+    crate::ipc::call(
         "workspace.focus",
         serde_json::json!({ "workspace_id": workspace_id }),
     )
-    .is_ok()
-    {
-        return Ok(());
-    }
-    match Command::new(herdr_bin()).args(["workspace", "focus", workspace_id]).output() {
-        Ok(o) if o.status.success() => Ok(()),
-        Ok(o) => Err(io::Error::other(first_stderr(&o))),
-        Err(e) => Err(e),
-    }
+    .map(|_| ())
 }
 
 fn fold_at(projects: &mut [Project], mem: &mut Memory, rows: &[Row], idx: usize, collapsed: bool) {
@@ -3362,27 +2691,17 @@ fn activation_target(projects: &[Project], rows: &[Row], idx: usize) -> Option<A
     }
 }
 
-fn activate(projects: &[Project], rows: &[Row], idx: usize) {
-    // Sidebar parity: headers and worktree rows address their space (first
-    // member owns merged headers); folding moved to h/l. Enter on an agent
-    // focuses its pane; the done-hold clears when the agent reports focused
-    // (or works again).
+fn activate(projects: &[Project], rows: &[Row], idx: usize) -> io::Result<()> {
     match activation_target(projects, rows, idx) {
-        Some(Activation::Space(ws)) => {
-            let _ = focus_workspace(&ws);
-        }
-        Some(Activation::Session(pane)) => focus_session(&pane),
-        None => {}
+        Some(target) => activate_target(target),
+        None => Ok(()),
     }
 }
 
-/// Click activation: cursor moves now, Herdr focus follows after dispatch.
-/// Enter/keys call activate() directly (immediate, no click precedes them).
-fn activate_deferred(projects: &[Project], rows: &[Row], idx: usize) {
-    match activation_target(projects, rows, idx) {
-        Some(Activation::Space(ws)) => focus_workspace_deferred(ws),
-        Some(Activation::Session(pane)) => focus_session_deferred(pane),
-        None => {}
+fn activate_target(target: Activation) -> io::Result<()> {
+    match target {
+        Activation::Space(ws) => focus_workspace(&ws),
+        Activation::Session(pane) => focus_session(&pane),
     }
 }
 
@@ -3411,6 +2730,8 @@ fn sync_collapse(projects: &[Project], mem: &mut Memory) {
         }
     }
     mem.dirty_state = true;
+    // Explicit folds must survive a native pane close before the activity debounce.
+    save_state(mem, true);
 }
 
 /// Identity of the visible frame. Equal signatures skip the draw entirely,
@@ -3468,7 +2789,10 @@ fn signature(input: &SigInput) -> String {
         match *row {
             Row::Project(pi) => {
                 let p = &projects[pi];
-                sig.push_str(&format!("{i}:P:{}:{}:{}:{}:{};", p.name, p.branch, p.collapsed, p.pinned, p.focused));
+                sig.push_str(&format!(
+                    "{i}:P:{}:{}:{}:{}:{};",
+                    p.name, p.branch, p.collapsed, p.pinned, p.focused
+                ));
             }
             Row::Worktree(pi, wi) => {
                 let w = &projects[pi].worktrees[wi];
@@ -3476,7 +2800,10 @@ fn signature(input: &SigInput) -> String {
             }
             Row::Agent(pi, wi, ai) => {
                 let a = &projects[pi].worktrees[wi].agents[ai];
-                sig.push_str(&format!("{i}:A:{}:{}:{}:{}:{}:{};", a.vendor, a.label, a.title, a.state as u8, a.tab_id, a.focused));
+                sig.push_str(&format!(
+                    "{i}:A:{}:{}:{}:{}:{}:{};",
+                    a.vendor, a.label, a.title, a.state as u8, a.tab_id, a.focused
+                ));
             }
         }
     }
@@ -3486,6 +2813,25 @@ fn signature(input: &SigInput) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browsing_retains_target_when_projects_reorder() {
+        let mut projects = stub();
+        let rows = visible(&projects, "", false, View::Grouped);
+        let selected = rows
+            .iter()
+            .position(|row| matches!(row, Row::Agent(0, 0, 0)))
+            .unwrap();
+        let target = activation_target(&projects, &rows, selected);
+        let (kind, id) = row_key(&projects, &rows, selected).unwrap();
+        let id = id.to_owned();
+        projects.reverse();
+        let rows = visible(&projects, "", false, View::Grouped);
+        let selected = row_index(&projects, &rows, (kind, &id)).unwrap();
+        assert_eq!(activation_target(&projects, &rows, selected), target);
+        projects.clear();
+        assert_eq!(row_index(&projects, &[], (kind, &id)), None);
+    }
 
     #[test]
     fn collapse_hides_children() {
@@ -3516,15 +2862,26 @@ mod tests {
         assert_eq!(vis[0], None);
         assert_eq!(vis[1], Some(0));
         // Exactly one blank between the two projects.
-        let second = rows.iter().position(|r| matches!(r, Row::Project(1))).unwrap();
+        let second = rows
+            .iter()
+            .position(|r| matches!(r, Row::Project(1)))
+            .unwrap();
         let at = vis.iter().position(|v| *v == Some(second)).unwrap();
         assert_eq!(vis[at - 1], None);
         // A worktree stays attached to its project header; later worktrees
         // take one blank gap so rows never touch (no rules anywhere).
-        let wt = rows.iter().position(|r| matches!(r, Row::Worktree(0, 0))).unwrap();
+        let wt = rows
+            .iter()
+            .position(|r| matches!(r, Row::Worktree(0, 0)))
+            .unwrap();
         let atw = vis.iter().position(|v| *v == Some(wt)).unwrap();
         assert!(vis[atw - 1].is_some());
-        let two_trees = vec![Row::Project(0), Row::Worktree(0, 0), Row::Agent(0, 0, 0), Row::Worktree(0, 1)];
+        let two_trees = vec![
+            Row::Project(0),
+            Row::Worktree(0, 0),
+            Row::Agent(0, 0, 0),
+            Row::Worktree(0, 1),
+        ];
         let vis2 = visual_rows_for_page(&two_trees, 0, 8);
         assert_eq!(vis2, vec![None, Some(0), Some(1), Some(2), None, Some(3)]);
         // Short window: the tail worktree still fits by visual lines…
@@ -3534,7 +2891,10 @@ mod tests {
         let (vis4, off) = window_for_selected(&two_trees, 0, 5, 3);
         assert!(vis4.contains(&Some(3)));
         assert!(off > 0);
-        let ag = rows.iter().position(|r| matches!(r, Row::Agent(0, 0, 0))).unwrap();
+        let ag = rows
+            .iter()
+            .position(|r| matches!(r, Row::Agent(0, 0, 0)))
+            .unwrap();
         let ata = vis.iter().position(|v| *v == Some(ag)).unwrap();
         assert!(vis[ata - 1].is_some());
         // Mouse hits: toolbar row and padding miss, first content row hits.
@@ -3574,12 +2934,27 @@ mod tests {
         let mut rows = [Rect::default(); 10];
         rows[0] = Rect::new(4, 4, 36, 1);
         rows[3] = Rect::new(4, 10, 36, 1);
-        assert!(matches!(modal_hit(51, 1, close, less, more, &rows), Some(ModalHit::Close)));
+        assert!(matches!(
+            modal_hit(51, 1, close, less, more, &rows),
+            Some(ModalHit::Close)
+        ));
         // The arrows sit inside row 0's rect: they must win over the row.
-        assert!(matches!(modal_hit(11, 4, close, less, more, &rows), Some(ModalHit::Less)));
-        assert!(matches!(modal_hit(21, 4, close, less, more, &rows), Some(ModalHit::More)));
-        assert!(matches!(modal_hit(5, 4, close, less, more, &rows), Some(ModalHit::Row(0))));
-        assert!(matches!(modal_hit(5, 10, close, less, more, &rows), Some(ModalHit::Row(3))));
+        assert!(matches!(
+            modal_hit(11, 4, close, less, more, &rows),
+            Some(ModalHit::Less)
+        ));
+        assert!(matches!(
+            modal_hit(21, 4, close, less, more, &rows),
+            Some(ModalHit::More)
+        ));
+        assert!(matches!(
+            modal_hit(5, 4, close, less, more, &rows),
+            Some(ModalHit::Row(0))
+        ));
+        assert!(matches!(
+            modal_hit(5, 10, close, less, more, &rows),
+            Some(ModalHit::Row(3))
+        ));
         assert!(modal_hit(0, 0, close, less, more, &rows).is_none());
     }
 
@@ -3603,33 +2978,16 @@ mod tests {
     }
 
     #[test]
-    fn launcher_decision_covers_cases() {
-        let empty = r#"{"result":{"panes":[]}}"#;
-        assert_eq!(launch_decision(empty, ""), "OPEN");
-        assert_eq!(launch_decision("garbage", ""), "OPEN");
-        let one = r#"{"result":{"panes":[
-            {"pane_id":"w1:p1","tab_id":"w1:t1","focused":true,"label":null,"terminal_title":"shell"},
-            {"pane_id":"w1:p2","tab_id":"w1:t1","focused":false,"label":"Projects","terminal_title":"Projects"}
-        ]}}"#;
-        assert_eq!(launch_decision(one, ""), "FOCUS w1:p2");
-        let focused = r#"{"result":{"panes":[
-            {"pane_id":"w1:p2","tab_id":"w1:t1","focused":true,"label":"Projects","terminal_title":"Projects"}
-        ]}}"#;
-        assert_eq!(launch_decision(focused, ""), "CLOSE w1:p2");
-        // A user pane merely titled "Projects" is never ours.
-        let spoof = r#"{"result":{"panes":[
-            {"pane_id":"w1:p9","tab_id":"w1:t1","focused":true,"label":null,"terminal_title":"vim Projects.md"}
-        ]}}"#;
-        assert_eq!(launch_decision(spoof, ""), "OPEN");
-        // Scoped to another tab: the sidebar elsewhere does not count.
-        assert_eq!(launch_decision(one, "w1:t9"), "OPEN");
-    }
-
-    #[test]
     fn theme_parses_row_rules_and_custom() {
         let text = "[theme.custom]\nyellow = \"#111111\"\n[ui.sidebar.agents]\nrows = [[{ token = \"x\", rules = [{ equals = \"working\", fg = \"#222222\" }] }]]";
-        assert_eq!(rule_color(text, "working"), Some(Color::Rgb(0x22, 0x22, 0x22)));
-        assert_eq!(custom_color(text, "yellow"), Some(Color::Rgb(0x11, 0x11, 0x11)));
+        assert_eq!(
+            rule_color(text, "working"),
+            Some(Color::Rgb(0x22, 0x22, 0x22))
+        );
+        assert_eq!(
+            custom_color(text, "yellow"),
+            Some(Color::Rgb(0x11, 0x11, 0x11))
+        );
         assert_eq!(parse_hex("#f9e2af"), Some(Color::Rgb(0xf9, 0xe2, 0xaf)));
         assert_eq!(parse_hex("nope"), None);
         // A rule without its own fg must not borrow the sibling's: all rules
@@ -3645,7 +3003,13 @@ mod tests {
         assert_eq!(rule_color(commented, "working"), None);
         // Unquoted values and multibyte tails do not panic or misread.
         assert_eq!(custom_color("yellow = #111111 # night\n", "yellow"), None);
-        assert_eq!(rule_color("equals = \"working\" \u{f418}glyphs { fg = \"#222222\" }", "working"), Some(Color::Rgb(0x22, 0x22, 0x22)));
+        assert_eq!(
+            rule_color(
+                "equals = \"working\" \u{f418}glyphs { fg = \"#222222\" }",
+                "working"
+            ),
+            Some(Color::Rgb(0x22, 0x22, 0x22))
+        );
     }
 
     #[test]
@@ -3680,9 +3044,14 @@ mod tests {
     fn socket_envelope_matches_cli_shape() {
         let snap = serde_json::json!({"agents": [{"pane_id": "w1:p1"}], "workspaces": []});
         let wrapped = envelope(&snap, "agents");
-        let agents = wrapped.pointer("/result/agents").and_then(|v| v.as_array()).unwrap();
+        let agents = wrapped
+            .pointer("/result/agents")
+            .and_then(|v| v.as_array())
+            .unwrap();
         assert_eq!(agents.len(), 1);
-        assert!(envelope(&snap, "missing").pointer("/result/missing").is_some());
+        assert!(envelope(&snap, "missing")
+            .pointer("/result/missing")
+            .is_some());
     }
 
     #[test]
@@ -3703,14 +3072,17 @@ mod tests {
         let main = ws("/repo/", "/repo/");
         let sib = ws("/wt/sib", "/repo/");
         let sub = ws("/wt/sib/child", "/repo/");
-        let by_id: BTreeMap<&str, &WorkspaceEntry> =
-            [("wC", &main), ("w1", &sib), ("w2", &sub)].into_iter().collect();
+        let by_id: BTreeMap<&str, &WorkspaceEntry> = [("wC", &main), ("w1", &sib), ("w2", &sub)]
+            .into_iter()
+            .collect();
         let members = ["wC", "w1", "w2"];
         // Main checkout anchors even when sorted last; absent root = None.
         assert_eq!(main_member(&members, &by_id), Some("wC"));
         assert_eq!(main_member(&["w1", "w2"], &by_id), None);
         let probes: BTreeMap<&str, &str> =
-            [("wC", "/repo"), ("w1", "/wt/sib"), ("w2", "/wt/sib/child")].into_iter().collect();
+            [("wC", "/repo"), ("w1", "/wt/sib"), ("w2", "/wt/sib/child")]
+                .into_iter()
+                .collect();
         assert_eq!(nest_level(&probes, Some("wC"), "wC"), 0);
         assert_eq!(nest_level(&probes, Some("wC"), "w1"), 1);
         assert_eq!(nest_level(&probes, Some("wC"), "w2"), 2);
@@ -3747,14 +3119,20 @@ mod tests {
         let mut projects = stub();
         projects[0].workspaces = vec!["wA".into()];
         let rows = visible(&projects, "", false, View::Grouped);
-        let header = rows.iter().position(|r| matches!(*r, Row::Project(0))).unwrap();
+        let header = rows
+            .iter()
+            .position(|r| matches!(*r, Row::Project(0)))
+            .unwrap();
         assert_eq!(
             activation_target(&projects, &rows, header),
             Some(Activation::Space("wA".into()))
         );
         // Empty member list: no target, no action.
         projects[1].workspaces = vec![];
-        let header1 = rows.iter().position(|r| matches!(*r, Row::Project(1))).unwrap();
+        let header1 = rows
+            .iter()
+            .position(|r| matches!(*r, Row::Project(1)))
+            .unwrap();
         assert_eq!(activation_target(&projects, &rows, header1), None);
         assert_eq!(activation_target(&projects, &rows, 9999), None);
     }
@@ -3801,38 +3179,6 @@ mod tests {
         load_state(&mut d);
         assert!(d.pinned.contains("w1Q"));
         std::env::remove_var("HERDR_PLUGIN_STATE_DIR");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn alive_verdict_fails_open() {
-        use std::io;
-        let live = Ok(serde_json::json!({"process_info": {"shell_pid": 42}}));
-        assert!(alive_verdict(&live));
-        let dead: io::Result<serde_json::Value> =
-            Ok(serde_json::json!({"process_info": {}}));
-        assert!(!alive_verdict(&dead));
-        let hiccup: io::Result<serde_json::Value> =
-            Err(io::Error::new(io::ErrorKind::TimedOut, "hiccup"));
-        assert!(alive_verdict(&hiccup));
-    }
-
-    #[test]
-    fn snooze_round_trip_and_sweep() {
-        let dir = std::env::temp_dir().join(format!("hps-snooze-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        snooze_set(&dir, "wC:t1");
-        assert!(snooze_is_set(&dir, "wC:t1"));
-        assert!(!snooze_is_set(&dir, "wC:t2"));
-        assert!(!snooze_is_set(&dir, ""));
-        snooze_set(&dir, "wX:t9");
-        let live: std::collections::BTreeSet<String> =
-            ["wC:t1".to_string()].into_iter().collect();
-        snooze_sweep(&dir, &live);
-        assert!(snooze_is_set(&dir, "wC:t1"));
-        assert!(!snooze_is_set(&dir, "wX:t9"));
-        snooze_clear(&dir, "wC:t1");
-        assert!(!snooze_is_set(&dir, "wC:t1"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

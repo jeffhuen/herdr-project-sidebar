@@ -1,6 +1,6 @@
 # herdr-project-sidebar agent contract
 
-Rust metadata publisher for Herdr's native Agents and Spaces lists, with a transient Ratatui settings popup.
+Two separate presentation implementations: a metadata publisher for Herdr's native Agents and Spaces lists, and a custom Ratatui terminal dock. Settings use a transient popup.
 
 ## Build and checks
 
@@ -19,7 +19,8 @@ herdr plugin action invoke configure --plugin herdr-project-sidebar
 ## Constraints
 
 - Perf budget: socket snapshot poll (300ms tick/snapshot floor, signature-skipped draws, windowed render) and delta-only metadata writes. No per-event process spawns.
-- Herdr owns navigation, visibility, selection, and agent lifecycle. Do not reintroduce a custom dock or duplicate lifecycle state.
+- Keep the native sidebar and terminal dock as separate strategies and implementations. Native-sidebar styling cannot replace the dock's custom presentation.
+- Herdr owns workspace, tab, pane, and agent lifecycle state. The dock reads that state and uses native APIs for navigation and pane placement; do not duplicate the lifecycle model.
 - Never subscribe to `pane.updated`: the echo pushes write latency from ~1ms to ~110ms (measured in herdr-radar recon).
 
 ## Shared procedures
