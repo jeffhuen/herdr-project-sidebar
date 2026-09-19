@@ -26,8 +26,12 @@ fn reload() -> io::Result<()> {
 fn main() -> io::Result<()> {
     match std::env::args().nth(1).as_deref() {
         None | Some("dock" | "--dock") => dock::run(),
-        Some("--toggle" | "toggle") => native::dock_command(dock_control::Command::Toggle),
-        Some("--ensure" | "ensure") => native::dock_command(dock_control::Command::Ensure),
+        Some("--toggle" | "toggle") => {
+            native::dock_command(dock_control::Command::Toggle, &ipc::Session::current()?)
+        }
+        Some("--ensure" | "ensure") => {
+            native::dock_command(dock_control::Command::Ensure, &ipc::Session::current()?)
+        }
         Some("--dump-snapshot") => dock::run(),
         Some("--configure") => {
             config::configure()?;

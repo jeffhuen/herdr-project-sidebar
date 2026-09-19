@@ -24,7 +24,7 @@ pub enum Command {
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 struct State {
-    session: (u64, u64),
+    session: String,
     terminal: Option<String>,
     tab: Option<String>,
     snoozed: BTreeSet<String>,
@@ -57,12 +57,27 @@ impl Pane {
 
 impl Controller {
     pub fn new(state_path: PathBuf) -> io::Result<Self> {
+        let session = ipc::Session::current()?;
         let socket = std::env::var_os("HERDR_SOCKET_PATH")
             .ok_or_else(|| invalid("HERDR_SOCKET_PATH is not set"))?;
         let metadata = fs::metadata(socket)?;
-        let session = (metadata.dev(), metadata.ino());
+        let legacy_session = (metadata.dev(), metadata.ino());
+        session.check()?;
+        let session = session.key().to_owned();
         let mut state: State = match fs::read(&state_path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Ok(bytes) => {
+                let mut value: Value = serde_json::from_slice(&bytes)?;
+                // Migrate the old dev/inode scope once without discarding this
+                // session's explicit tab snoozes.
+                if value["session"].is_array() {
+                    value["session"] = if value["session"] == json!(legacy_session) {
+                        json!(session)
+                    } else {
+                        json!("")
+                    };
+                }
+                serde_json::from_value(value)?
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => State::default(),
             Err(error) => return Err(error),
         };
@@ -81,12 +96,12 @@ impl Controller {
         Ok(controller)
     }
 
-    pub fn reconcile(&mut self, snapshot: &Value, settings: &Settings) -> io::Result<()> {
+    pub fn reconcile(&mut self, snapshot: &ipc::Snapshot, settings: &Settings) -> io::Result<()> {
         let dock = self.observe(snapshot)?;
         if !settings.enabled {
-            return self.close(dock.as_ref(), None);
+            return self.close(&snapshot.session, dock.as_ref(), None);
         }
-        let Some(target) = target(snapshot, None)? else {
+        let Some(target) = target(&snapshot.data, None)? else {
             return Ok(());
         };
         if self.state.snoozed.contains(&target.tab) {
@@ -98,24 +113,39 @@ impl Controller {
         self.place(snapshot, dock, &target, settings, false)
     }
 
-    pub fn command(&mut self, command: Command, caller_tab_id: Option<&str>) -> io::Result<()> {
-        let response = ipc::call("session.snapshot", json!({}))?;
-        let snapshot = &response["snapshot"];
+    pub fn command(
+        &mut self,
+        command: Command,
+        caller_tab_id: Option<&str>,
+        session_key: &str,
+    ) -> io::Result<()> {
+        let snapshot = ipc::session_snapshot()?;
+        if snapshot.session.key() != session_key {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "dock command belongs to a replaced Herdr session",
+            ));
+        }
+        let snapshot = &snapshot;
         let settings = config::load()?;
         if matches!(command, Command::Ensure) {
             return self.reconcile(snapshot, &settings);
         }
         let dock = self.observe(snapshot)?;
         if matches!(command, Command::Close) {
-            return self.close(dock.as_ref(), dock.as_ref().map(|pane| pane.tab.as_str()));
+            return self.close(
+                &snapshot.session,
+                dock.as_ref(),
+                dock.as_ref().map(|pane| pane.tab.as_str()),
+            );
         }
         if !settings.enabled {
             return Err(io::Error::other("Projects is disabled in settings"));
         }
-        let target = target(snapshot, caller_tab_id)?
+        let target = target(&snapshot.data, caller_tab_id)?
             .ok_or_else(|| invalid("no caller or focused pane for Projects"))?;
         if dock.as_ref().is_some_and(|pane| pane.tab == target.tab) {
-            return self.close(dock.as_ref(), Some(&target.tab));
+            return self.close(&snapshot.session, dock.as_ref(), Some(&target.tab));
         }
         self.state.snoozed.remove(&target.tab);
         self.save()?;
@@ -156,10 +186,17 @@ impl Controller {
         Ok(())
     }
 
-    fn observe(&mut self, snapshot: &Value) -> io::Result<Option<Pane>> {
-        let panes = array(snapshot, "panes")?;
-        let tabs = array(snapshot, "tabs")?;
-        array(snapshot, "layouts")?;
+    fn observe(&mut self, snapshot: &ipc::Snapshot) -> io::Result<Option<Pane>> {
+        snapshot.session.check()?;
+        let panes = array(&snapshot.data, "panes")?;
+        let tabs = array(&snapshot.data, "tabs")?;
+        array(&snapshot.data, "layouts")?;
+        if self.state.session != snapshot.session.key() {
+            self.state = State {
+                session: snapshot.session.key().to_owned(),
+                ..State::default()
+            };
+        }
         self.state
             .snoozed
             .retain(|id| tabs.iter().any(|tab| tab["tab_id"] == *id));
@@ -191,13 +228,19 @@ impl Controller {
         Ok(dock)
     }
 
-    fn close(&mut self, dock: Option<&Pane>, tab: Option<&str>) -> io::Result<()> {
+    fn close(
+        &mut self,
+        session: &ipc::Session,
+        dock: Option<&Pane>,
+        tab: Option<&str>,
+    ) -> io::Result<()> {
+        session.check()?;
         if let Some(tab) = tab {
             self.state.snoozed.insert(tab.to_owned());
         }
         self.save()?;
         if let Some(pane) = dock {
-            ipc::call("pane.close", json!({"pane_id": pane.id}))?;
+            session.call("pane.close", json!({"pane_id": pane.id}))?;
             self.state.terminal = None;
             self.state.tab = None;
             self.save()?;
@@ -207,12 +250,15 @@ impl Controller {
 
     fn place(
         &mut self,
-        snapshot: &Value,
+        snapshot: &ipc::Snapshot,
         dock: Option<Pane>,
         target: &Pane,
         settings: &Settings,
         focus: bool,
     ) -> io::Result<()> {
+        let session = &snapshot.session;
+        let snapshot = &snapshot.data;
+        session.check()?;
         if self.state.opening && dock.is_none() {
             return Err(io::Error::other(format!(
                 "Projects open has an uncertain result; refusing a duplicate launch. Inspect native panes, close any unmarked Projects pane, then stop the sidebar daemon and remove {} before retrying",
@@ -228,7 +274,7 @@ impl Controller {
                 return Ok(());
             }
         }
-        let before = current()?;
+        let before = current(session)?;
         // The snapshot is a decision input, not authority to undo a later user focus.
         if !focus && snapshot["focused_pane_id"] != before.id {
             return Ok(());
@@ -241,7 +287,7 @@ impl Controller {
             }
             Some(pane) => {
                 let content = content_target(destination, None, settings.dock_right)?;
-                let response = ipc::call(
+                let response = session.call(
                     "pane.move",
                     json!({
                         "pane_id": pane.id,
@@ -274,7 +320,7 @@ impl Controller {
                 let content = content_target(destination, None, settings.dock_right)?;
                 self.state.opening = true;
                 self.save()?;
-                let opened = ipc::call(
+                let opened = session.call(
                     "plugin.pane.open",
                     json!({
                         "plugin_id": "herdr-project-sidebar", "entrypoint": "projects",
@@ -285,7 +331,7 @@ impl Controller {
                 let response = match opened {
                     Ok(response) => response,
                     Err(error) => {
-                        // ipc::call uses Other without an OS code only for a native error reply.
+                        // Session::call uses Other without an OS code only for a native error reply.
                         if error.kind() == io::ErrorKind::Other && error.raw_os_error().is_none() {
                             self.state.opening = false;
                             self.save()?;
@@ -298,14 +344,14 @@ impl Controller {
                 self.state.tab = Some(pane.tab.clone());
                 self.state.opening = false;
                 self.save()?;
-                ipc::call(
+                session.call(
                     "pane.report_metadata",
                     json!({
                         "pane_id": pane.id, "source": SOURCE, "tokens": {"hps_dock": "projects"}
                     }),
                 )?;
                 live_layout =
-                    ipc::call("pane.layout", json!({"pane_id": pane.id}))?["layout"].clone();
+                    session.call("pane.layout", json!({"pane_id": pane.id}))?["layout"].clone();
                 pane
             }
         };
@@ -318,11 +364,11 @@ impl Controller {
         if wanted_edge > dock_edge + 1.0 {
             // Swap always focuses its source, even for background tabs. Restore the
             // actual previous focus, not the content pane we happened to split.
-            let latest = current()?;
+            let latest = current(session)?;
             if latest.terminal != before.terminal {
                 return Ok(());
             }
-            let swapped = ipc::call(
+            let swapped = session.call(
                 "pane.swap",
                 json!({
                     "source_pane_id": pane.id, "target_pane_id": edge
@@ -332,9 +378,9 @@ impl Controller {
                 if focus {
                     return Ok(());
                 }
-                let after = current()?;
+                let after = current(session)?;
                 if after.terminal == pane.terminal && before.terminal != pane.terminal {
-                    ipc::call("pane.focus", json!({"pane_id": before.id}))?;
+                    session.call("pane.focus", json!({"pane_id": before.id}))?;
                 }
                 Ok::<(), io::Error>(())
             })();
@@ -347,13 +393,13 @@ impl Controller {
             }
             live_layout = response["swap"]["layout"].clone();
         }
-        self.size(&pane, &live_layout, settings.width)?;
+        self.size(session, &pane, &live_layout, settings.width)?;
         // Recover a missing token after a successful open whose metadata reply failed.
         if array(snapshot, "panes")?.iter().any(|p| {
             p["terminal_id"] == pane.terminal
                 && p.pointer("/tokens/hps_dock").and_then(Value::as_str) != Some("projects")
         }) {
-            ipc::call(
+            session.call(
                 "pane.report_metadata",
                 json!({
                     "pane_id": pane.id, "source": SOURCE, "tokens": {"hps_dock": "projects"}
@@ -361,12 +407,18 @@ impl Controller {
             )?;
         }
         if focus {
-            ipc::call("pane.focus", json!({"pane_id": pane.id}))?;
+            session.call("pane.focus", json!({"pane_id": pane.id}))?;
         }
         Ok(())
     }
 
-    fn size(&mut self, pane: &Pane, layout: &Value, width: u16) -> io::Result<()> {
+    fn size(
+        &mut self,
+        session: &ipc::Session,
+        pane: &Pane,
+        layout: &Value,
+        width: u16,
+    ) -> io::Result<()> {
         if layout["zoomed"] == true {
             return Ok(());
         }
@@ -375,7 +427,7 @@ impl Controller {
         if (visible - f64::from(width)).abs() <= 1.0 {
             return Ok(());
         }
-        let exported = ipc::call("layout.export", json!({"pane_id": pane.id}))?;
+        let exported = session.call("layout.export", json!({"pane_id": pane.id}))?;
         if exported["layout"]["zoomed"] == true {
             return Ok(());
         }
@@ -393,7 +445,7 @@ impl Controller {
         if (desired - split.ratio).abs() < 0.00001 {
             return Ok(());
         }
-        ipc::call(
+        session.call(
             "layout.set_split_ratio",
             json!({
                 "pane_id": pane.id, "path": split.path, "ratio": desired
@@ -428,8 +480,8 @@ fn number(value: &Value, key: &str) -> io::Result<f64> {
         .ok_or_else(|| invalid(format!("native response omitted {key}")))
 }
 
-fn current() -> io::Result<Pane> {
-    Pane::parse(&ipc::call("pane.current", json!({}))?["pane"])
+fn current(session: &ipc::Session) -> io::Result<Pane> {
+    Pane::parse(&session.call("pane.current", json!({}))?["pane"])
 }
 
 fn target(snapshot: &Value, caller_tab: Option<&str>) -> io::Result<Option<Pane>> {

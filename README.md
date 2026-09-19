@@ -33,6 +33,7 @@ automatically. No server restart is needed.
 - In the dock, `j/k` or arrows browse, `Enter` activates, and `h/l` fold/unfold.
   Browsing does not snap back after a timeout. Click and release on a row to
   activate it. `p` pins, `/` filters, `[`/`]` change width, and `q` closes.
+  Agent counts and **Settings** appear in the bottom bar. The settings popup opens above it.
 - `prefix+p` switches between Projects styling and your previous Herdr rows.
   It changes both the row layout and the sort override, without moving focus,
   closing the sidebar, or creating panes. This replaces the default previous-tab
@@ -61,13 +62,14 @@ herdr plugin config-dir herdr-project-sidebar
 - **Width:** 24-80 columns for the dock split. Herdr's split-ratio limits can
   constrain the width in narrow layouts.
 - **Dock side:** left or right, applied to the existing pane without restarting it.
-- **Start open by default:** create a missing dock in tabs you have not manually
+- **Auto open:** create a missing dock in tabs you have not manually
   closed it in. An already open dock continues following when this is off.
 - **Order:** project/worktree groups in workspace order, or recent native state
   changes. This does not create a separate activity history.
 - **Branches:** worktree headers and native Spaces branch/git-status rows.
 - **Task titles:** the native session title (including title overrides), or just the agent name.
-- **Quiet idle titles:** use a readable, muted color for Herdr's idle state.
+- **Quiet idle titles:** currently has no effect. Both renderers use their idle
+  colors regardless of this setting.
 - **Agent icons:** text, compact font, or none. Text is the default.
 - **Sidebar style:** Projects or your previous Herdr rows, also on `prefix+p`.
 - **Install compact font:** copies the optional face into your user font directory.
@@ -133,12 +135,35 @@ ownership record, and dock pin/fold state live under `HERDR_PLUGIN_STATE_DIR`.
 
 ## Runtime
 
-One Rust controller reads Herdr's atomic `session.snapshot` on a 300ms floor.
-It writes only changed display tokens and moves the same dock with `pane.move`.
-Cross-workspace moves change the public pane ID, not the terminal or process.
-Focus events do not spawn launchers. Neither process subscribes to `pane.updated`.
-The dock polls at a 300ms floor, skips unchanged frames, and renders a window
-around the browsing cursor.
+The native publisher and terminal dock each subscribe to Herdr's semantic topology
+and agent-status events. Notifications trigger full `session.snapshot` reads,
+coalesced on a 300ms floor, with a five-second recovery read for missed changes.
+Native working/blocked animation still refreshes on the 300ms floor. The dock
+animates independently, skips unchanged frames, and renders a window around the
+browsing cursor. Neither process subscribes to `pane.updated`; focus events do
+not spawn launchers, and metadata writes contain only changed tokens.
+
+Agent selection and activity history use `terminal_id`; native commands use the
+current pane and workspace IDs. A moved agent keeps its selection and history;
+a removed browsed agent clears selection rather than selecting its replacement
+row. Repository pins use the canonical repository key.
+
+Every snapshot carries its socket incarnation. Snapshot-derived commands check
+that incarnation before and after connecting, so an old view cannot target a
+replacement server's reused IDs. Activity files are scoped to that incarnation
+and bounded to one file per socket path. Legacy unscoped activity is not reused.
+Reconnection obtains a new baseline; the daemon exits after 30 seconds of
+continuous missing/refused connections instead of running indefinitely.
+
+Failed snapshots retain the last valid tree. Non-destructive focus actions wait
+for a usable snapshot, coalescing to the latest intent; failure, cancellation,
+target removal, or session replacement discards the intent. Destructive actions
+are refused while the view is stale.
+
+The public plugin API has no boot/revision snapshot stream or event replay
+cursor, unlike Herdr's native client protocol. Herdr 0.9.1 also checks each
+per-agent status subscription at 100ms intervals on the server. Fewer full
+snapshots do not imply an equivalent reduction in server-side work.
 
 Placement uses native splits and absolute ratios. Moving into or out of a zoomed
 tab waits until you unzoom it. Existing multi-row layouts are preserved; the dock
@@ -150,7 +175,7 @@ commands can also redirect other clients. Use Herdr's native lists when independ
 client navigation is required.
 
 Herdr 0.9.1 can deliver a terminal click before its queued pane-focus operation.
-That late operation can override the dock's requested destination. The dock sends
-one activation on release and does not run delayed focus retries. Keyboard Enter
-avoids this mouse ordering race. Tracked in
+That late operation can override the dock's requested destination. Each click
+produces at most one activation, delayed if a snapshot refresh is pending; the
+dock does not retry focus. Keyboard Enter avoids this mouse ordering race. Tracked in
 [Herdr #4390](https://github.com/herdrdev/herdr/issues/4390).

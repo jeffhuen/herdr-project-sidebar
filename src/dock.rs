@@ -1,22 +1,17 @@
 //! herdr-project-sidebar: Collapsible project -> worktree -> agent tree.
-//! Live Herdr sync in `snapshot()`: one socket session.snapshot (agents,
-//! workspaces, focus); CLI list pair is fallback only. Render keeps the same
-//! row shape so the tree builder does not change.
-//!
-//! Perf notes: deadline-driven tick (150ms only while a visible agent works,
-//! 1s idle sleep), signature-skipped draws, windowed render (only the visible
-//! slice builds widgets), input/mouse interrupt the wait immediately. Snapshot
-//! refreshes at most once per second plus on demand -- never per event, never
-//! per tick, and never via `pane.updated` (own-echo stalls writes ~110ms).
+//! Change-driven socket snapshots feed the custom tree. Failed refreshes keep
+//! the last view but disable native actions until synchronization recovers.
+//! Rendering remains signature-skipped and windowed, with 150ms animation.
 //!
 //! Theming: colors come from Herdr's own `config.toml` (`theme.custom` +
 //! `ui.sidebar.agents` row rules) with built-in defaults when absent. Nothing
 //! is written back; light/dark follows whatever theme is configured.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io;
-use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::activity::{now_unix_ms, ActivityStore, Freshness};
 
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton, MouseEventKind,
@@ -35,16 +30,13 @@ use serde::Deserialize;
 const SPINNER: [&str; 8] = ["⣷", "⣯", "⣟", "⡿", "⢿", "⣻", "⣽", "⣾"];
 const TICK: Duration = Duration::from_millis(150);
 const IDLE_POLL: Duration = Duration::from_millis(300);
-// Bound snapshot reads independently of animation and input.
-const SNAPSHOT_MIN_AGE: Duration = Duration::from_millis(300);
+const NO_SELECTION: usize = usize::MAX;
 const BRANCH_TTL: Duration = Duration::from_secs(5);
 /// Explicit holds outvote adopted vetoes this long; afterwards recency is
 /// unknowable and vetoes apply normally so stale pins always converge away.
 const VETO_GRACE_SECS: u64 = 60;
 const STATE_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
 
-const FRESH_SECS: u64 = 15 * 60;
-const STALE_SECS: u64 = 2 * 60 * 60;
 const PANE_TITLE: &str = "Projects";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
@@ -97,6 +89,7 @@ struct Agent {
     label: String,
     title: String,
     state: State,
+    terminal_id: String,
     pane_id: String,
     tab_id: String,
     workspace_id: String,
@@ -142,12 +135,33 @@ fn row_key<'a>(projects: &'a [Project], rows: &[Row], idx: usize) -> Option<(u8,
     Some(match *rows.get(idx)? {
         Row::Project(pi) => (0, &projects[pi].id),
         Row::Worktree(pi, wi) => (1, &projects[pi].worktrees[wi].key),
-        Row::Agent(pi, wi, ai) => (2, &projects[pi].worktrees[wi].agents[ai].pane_id),
+        Row::Agent(pi, wi, ai) => (2, &projects[pi].worktrees[wi].agents[ai].terminal_id),
     })
 }
 
 fn row_index(projects: &[Project], rows: &[Row], key: (u8, &str)) -> Option<usize> {
     (0..rows.len()).find(|&idx| row_key(projects, rows, idx) == Some(key))
+}
+
+fn restore_selection(
+    projects: &[Project],
+    rows: &[Row],
+    key: Option<(u8, &str)>,
+    browsing: bool,
+) -> usize {
+    let preserved = key.and_then(|key| row_index(projects, rows, key));
+    if browsing {
+        return preserved.unwrap_or(NO_SELECTION);
+    }
+    let focused = projects
+        .iter()
+        .flat_map(|p| &p.worktrees)
+        .flat_map(|w| &w.agents)
+        .find(|a| a.focused)
+        .map(|a| a.pane_id.as_str());
+    seat_row(projects, rows, focused)
+        .or(preserved)
+        .unwrap_or(NO_SELECTION)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -182,7 +196,8 @@ fn stub() -> Vec<Project> {
                         label: "pi".into(),
                         title: "Implement OAuth scopes".into(),
                         state: State::Working,
-                        pane_id: "".into(),
+                        terminal_id: "alpha".into(),
+                        pane_id: "w1:p1".into(),
                         workspace_id: "".into(),
                         tab_id: "".into(),
                         seq: 0,
@@ -193,7 +208,8 @@ fn stub() -> Vec<Project> {
                         label: "codex".into(),
                         title: "Wire retry budget".into(),
                         state: State::Done,
-                        pane_id: "".into(),
+                        terminal_id: "beta".into(),
+                        pane_id: "w1:p2".into(),
                         workspace_id: "".into(),
                         tab_id: "".into(),
                         seq: 0,
@@ -204,7 +220,8 @@ fn stub() -> Vec<Project> {
                         label: "opencode".into(),
                         title: "Migrate invoices table".into(),
                         state: State::Idle,
-                        pane_id: "".into(),
+                        terminal_id: "gamma".into(),
+                        pane_id: "w1:p3".into(),
                         workspace_id: "".into(),
                         tab_id: "".into(),
                         seq: 0,
@@ -235,7 +252,8 @@ fn stub() -> Vec<Project> {
                     label: "claude".into(),
                     title: "Which env file should I edit?".into(),
                     state: State::Blocked,
-                    pane_id: "".into(),
+                    terminal_id: "delta".into(),
+                    pane_id: "w2:p1".into(),
                     workspace_id: "".into(),
                     tab_id: "".into(),
                     seq: 0,
@@ -246,35 +264,11 @@ fn stub() -> Vec<Project> {
     ]
 }
 
-// ---------- Herdr CLI snapshot ----------
-
-fn herdr_bin() -> String {
-    std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into())
-}
-
-fn herdr_json(args: &[&str]) -> Option<serde_json::Value> {
-    let out = Command::new(herdr_bin()).args(args).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    serde_json::from_slice(&out.stdout).ok()
-}
-
-/// Wrap one socket-snapshot array in the CLI envelope shape so the parser
-/// below serves both transports.
-fn envelope(snap: &serde_json::Value, key: &str) -> serde_json::Value {
-    let mut inner = serde_json::Map::new();
-    inner.insert(
-        key.to_owned(),
-        snap.get(key).cloned().unwrap_or(serde_json::Value::Null),
-    );
-    let mut outer = serde_json::Map::new();
-    outer.insert("result".to_owned(), serde_json::Value::Object(inner));
-    serde_json::Value::Object(outer)
-}
+// ---------- Snapshot tree ----------
 
 #[derive(Deserialize)]
 struct AgentEntry {
+    terminal_id: String,
     #[serde(default)]
     agent: String,
     #[serde(default)]
@@ -456,9 +450,7 @@ fn checkout_is_linked(start: &str) -> bool {
 /// Short-term memory across snapshots: activity stamps, held badges, collapse.
 #[derive(Default)]
 struct Memory {
-    /// pane_id -> unix secs last seen working. Feeds the idle freshness
-    /// decoration only; lifecycle (done/blocked/unknown) is authoritative.
-    activity: BTreeMap<String, u64>,
+    activity: ActivityStore,
     collapsed_projects: BTreeSet<String>,
     collapsed_worktrees: BTreeSet<String>,
     pinned: BTreeSet<String>,
@@ -478,25 +470,119 @@ struct Memory {
     last_state_save: Option<std::time::Instant>,
     /// checkout path -> branch, via native worktree.list (5s TTL).
     branches: BTreeMap<String, String>,
+    linked_checkouts: HashSet<String>,
     branch_at: Option<std::time::Instant>,
 }
 
 impl Memory {
-    fn freshness(&self, pane_id: &str, now: u64) -> State {
-        match self.activity.get(pane_id) {
-            None => State::Idle,
-            Some(at) => {
-                let age = now.saturating_sub(*at);
-                if age <= FRESH_SECS {
-                    State::IdleFresh
-                } else if age >= STALE_SECS {
-                    State::IdleStale
-                } else {
-                    State::Idle
+    fn freshness(&self, terminal_id: &str, now_ms: u64) -> State {
+        match self.activity.freshness(terminal_id, now_ms) {
+            Freshness::Fresh => State::IdleFresh,
+            Freshness::Normal => State::Idle,
+            Freshness::Stale => State::IdleStale,
+        }
+    }
+}
+
+/// Refresh optional branch metadata independently of snapshot tree construction.
+fn refresh_branches(snap: &serde_json::Value, mem: &mut Memory) {
+    if mem.branch_at.is_some_and(|at| at.elapsed() < BRANCH_TTL) {
+        return;
+    }
+    let workspaces = snap["workspaces"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let agents = snap["agents"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let roots: BTreeSet<&str> = workspaces
+        .iter()
+        .filter_map(|w| w.pointer("/worktree/repo_root").and_then(|v| v.as_str()))
+        .filter(|root| !root.is_empty())
+        .collect();
+    mem.branches =
+        crate::ipc::branch_map(&roots.into_iter().map(str::to_owned).collect::<Vec<_>>());
+    mem.linked_checkouts.clear();
+    let probes: BTreeSet<&str> = workspaces
+        .iter()
+        .filter_map(|w| {
+            w.pointer("/worktree/checkout_path")
+                .and_then(|v| v.as_str())
+        })
+        .chain(agents.iter().filter_map(|a| {
+            a["foreground_cwd"]
+                .as_str()
+                .filter(|p| !p.is_empty())
+                .or_else(|| a["cwd"].as_str())
+        }))
+        .filter(|probe| !probe.is_empty())
+        .collect();
+    for probe in probes {
+        let key = probe.trim_end_matches('/');
+        if !mem.branches.contains_key(key) {
+            if let Some(branch) = git_branch(probe) {
+                mem.branches.insert(key.to_owned(), branch);
+            }
+        }
+        if checkout_is_linked(probe) {
+            mem.linked_checkouts.insert(probe.to_owned());
+        }
+    }
+    mem.branch_at = Some(std::time::Instant::now());
+}
+
+fn install_snapshot(
+    snap: &crate::ipc::Snapshot,
+    mem: &mut Memory,
+    theme_projects: &[Color],
+    font: bool,
+) -> io::Result<Vec<Project>> {
+    if mem.activity.sync_session(&snap.session)? {
+        mem.branches.clear();
+        mem.linked_checkouts.clear();
+        mem.branch_at = None;
+    }
+    refresh_branches(&snap.data, mem);
+    snap.session.check()?;
+    let now_ms = now_unix_ms();
+    let mut projects = snapshot(&snap.data, mem, theme_projects, font, now_ms)?;
+    let live = projects
+        .iter()
+        .flat_map(|p| &p.worktrees)
+        .flat_map(|w| &w.agents)
+        .map(|a| a.terminal_id.as_str())
+        .collect();
+    mem.activity.retain_live(&live);
+    for a in projects
+        .iter()
+        .flat_map(|p| &p.worktrees)
+        .flat_map(|w| &w.agents)
+    {
+        if matches!(a.state, State::Working | State::Monitoring) {
+            mem.activity.mark_working(&a.terminal_id, now_ms);
+        }
+    }
+    // Convert old member folds once. Keeping the alias would resurrect an
+    // unfolded repo on its next snapshot or another dock's state merge.
+    for project in &mut projects {
+        if project.id.starts_with("repo:") {
+            let mut migrated = false;
+            for workspace in &project.workspaces {
+                if mem.collapsed_projects.remove(workspace) {
+                    touch_release(mem, &format!("c:{workspace}"));
+                    migrated = true;
                 }
+            }
+            if migrated {
+                let key = format!("c:{}", project.id);
+                if !mem.dropped.contains(&key) {
+                    mem.collapsed_projects.insert(project.id.clone());
+                    project.collapsed = true;
+                }
+                mem.dirty_state = true;
             }
         }
     }
+    Ok(projects)
 }
 
 fn agent_title(e: &AgentEntry) -> String {
@@ -537,7 +623,6 @@ fn agent_title(e: &AgentEntry) -> String {
         .unwrap_or_else(|| e.cwd.clone())
 }
 
-/// Snapshot Herdr state. Returns projects plus a sync error: total CLI
 /// Row index of an agent pane in the current view, if it is listed.
 fn focus_row(projects: &[Project], rows: &[Row], pane_id: &str) -> Option<usize> {
     rows.iter().position(|r| match *r {
@@ -557,101 +642,37 @@ fn seat_row(projects: &[Project], rows: &[Row], focused_pane: Option<&str>) -> O
         })
 }
 
-/// Ownership contract: Herdr owns ALL source state (spaces, tabs, panes,
-/// sessions, focus, worktree links) via one socket snapshot per refresh. The
-/// dock owns only view state (cursor, folds, pins) and derived badges
-/// (activity, done latch). It never contradicts Herdr focus or membership;
-/// when Herdr is unreachable it renders the error, never guesses. Branch
-/// labels come from native worktree.list per repo (5s TTL); the git-file
-/// probe below is fallback only (socket down, unlisted path).
-/// failure renders an empty tree with the error in the header -- never
-/// fictional stub rows (stub() is tests-only).
+/// Build the tree from one complete snapshot. No transport or filesystem I/O.
 fn snapshot(
-    mem: &mut Memory,
+    snap: &serde_json::Value,
+    mem: &Memory,
     theme_projects: &[Color],
     font_ok: bool,
-) -> (Vec<Project>, Option<String>) {
-    // One socket round-trip carries agents, workspaces, and focus state; the
-    // CLI pair is fallback only (no socket outside Herdr), never the hot path.
-    // ponytail: no event thread in the TUI; the 1s socket poll is the whole sync.
-    let snap = crate::ipc::call("session.snapshot", serde_json::json!({})).ok();
-    let agents_v = snap
-        .as_ref()
-        .and_then(|v| v.get("snapshot"))
-        .map(|s| envelope(s, "agents"))
-        .or_else(|| herdr_json(&["agent", "list"]));
-    let workspaces_v = snap
-        .as_ref()
-        .and_then(|v| v.get("snapshot"))
-        .map(|s| envelope(s, "workspaces"))
-        .or_else(|| herdr_json(&["workspace", "list"]));
-    if agents_v.is_none() && workspaces_v.is_none() {
-        return (
-            Vec::new(),
-            Some("herdr unreachable (agent + workspace list failed)".into()),
-        );
-    }
-    let now = now_secs();
-    let mut agents: Vec<AgentEntry> = agents_v
-        .as_ref()
-        .and_then(|v| v.pointer("/result/agents"))
-        .and_then(|v| {
-            v.as_array().map(|a| {
-                a.iter()
-                    .filter_map(|e| serde_json::from_value(e.clone()).ok())
-                    .collect()
-            })
+    now_ms: u64,
+) -> io::Result<Vec<Project>> {
+    let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
+    let mut agents: Vec<AgentEntry> = serde_json::from_value(snap["agents"].clone())
+        .map_err(|e| invalid(format!("invalid snapshot agents: {e}")))?;
+    let workspaces: Vec<WorkspaceEntry> = serde_json::from_value(snap["workspaces"].clone())
+        .map_err(|e| invalid(format!("invalid snapshot workspaces: {e}")))?;
+    let mut terminals = HashSet::new();
+    if workspaces.iter().any(|w| w.workspace_id.trim().is_empty())
+        || agents.iter().any(|a| {
+            a.terminal_id.trim().is_empty()
+                || !terminals.insert(a.terminal_id.as_str())
+                || a.pane_id.trim().is_empty()
+                || !workspaces.iter().any(|w| w.workspace_id == a.workspace_id)
         })
-        .unwrap_or_default();
-    let workspaces: Vec<WorkspaceEntry> = workspaces_v
-        .as_ref()
-        .and_then(|v| v.pointer("/result/workspaces"))
-        .and_then(|v| {
-            v.as_array().map(|a| {
-                a.iter()
-                    .filter_map(|e| serde_json::from_value(e.clone()).ok())
-                    .collect()
-            })
-        })
-        .unwrap_or_default();
-
-    // Stamp work for the idle freshness decoration. Lifecycle states are
-    // authoritative: no latches, no rewrites.
-    for a in &agents {
-        if a.agent_status == "working" || a.agent_status == "monitoring" {
-            mem.activity.insert(a.pane_id.clone(), now);
-            mem.dirty_state = true;
-        }
-    }
-    // Prune memory for vanished panes so maps and state.json stay bounded.
     {
-        let live: BTreeSet<&str> = agents.iter().map(|a| a.pane_id.as_str()).collect();
-        mem.activity.retain(|k, _| live.contains(k.as_str()));
+        return Err(invalid(
+            "snapshot has missing or duplicate agent identity or workspace".into(),
+        ));
     }
-
+    drop(terminals);
     let ws_by_id: BTreeMap<&str, &WorkspaceEntry> = workspaces
         .iter()
         .map(|w| (w.workspace_id.as_str(), w))
         .collect();
-    // Native branch map, refreshed at TTL: one socket round trip per repo.
-    {
-        let mut roots: Vec<String> = ws_by_id
-            .values()
-            .filter_map(|w| w.worktree.as_ref())
-            .map(|t| t.repo_root.clone())
-            .filter(|r| !r.is_empty())
-            .collect();
-        roots.sort();
-        roots.dedup();
-        if mem
-            .branch_at
-            .map(|t| t.elapsed() >= BRANCH_TTL)
-            .unwrap_or(true)
-        {
-            mem.branches = crate::ipc::branch_map(&roots);
-            mem.branch_at = Some(std::time::Instant::now());
-        }
-    }
     fn repo_of(ws_by_id: &BTreeMap<&str, &WorkspaceEntry>, ws_id: &str) -> Option<String> {
         ws_by_id
             .get(ws_id)
@@ -695,15 +716,21 @@ fn snapshot(
     // or_insert (not or_insert_with): the repo usually exists already via a
     // sibling checkout, and only the missing member is added.
     for w in &workspaces {
-        let key = match repo_of(&ws_by_id, &w.workspace_id) {
-            Some(repo) => PJKey::Repo(repo),
-            None => PJKey::Solo(w.workspace_id.clone()),
-        };
-        groups
-            .entry(key)
-            .or_default()
-            .entry(w.workspace_id.clone())
-            .or_default();
+        match repo_of(&ws_by_id, &w.workspace_id) {
+            Some(repo) => {
+                groups
+                    .entry(PJKey::Repo(repo))
+                    .or_default()
+                    .entry(w.workspace_id.clone())
+                    .or_default();
+            }
+            None => {
+                // An occupied Solo workspace already has its cwd groups.
+                groups
+                    .entry(PJKey::Solo(w.workspace_id.clone()))
+                    .or_insert_with(|| BTreeMap::from([(w.workspace_id.clone(), Vec::new())]));
+            }
+        }
     }
 
     let mut projects = Vec::new();
@@ -793,14 +820,14 @@ fn snapshot(
                     .get(probe.trim_end_matches('/'))
                     .filter(|b| !b.is_empty())
                     .cloned()
-                    .unwrap_or_else(|| git_branch(&probe).unwrap_or_default())
+                    .unwrap_or_default()
             };
             let mut list: Vec<Agent> = entries
                 .iter()
                 .map(|e| {
                     let mut st = map_status(&e.agent_status);
                     if st == State::Idle {
-                        st = mem.freshness(&e.pane_id, now);
+                        st = mem.freshness(&e.terminal_id, now_ms);
                     }
                     Agent {
                         vendor: if e.agent.is_empty() {
@@ -821,6 +848,7 @@ fn snapshot(
                             }),
                         title: agent_title(e),
                         state: st,
+                        terminal_id: e.terminal_id.clone(),
                         pane_id: e.pane_id.clone(),
                         tab_id: e.tab_id.clone(),
                         workspace_id: e.workspace_id.clone(),
@@ -830,7 +858,8 @@ fn snapshot(
                 })
                 .collect();
             list.sort_by_key(|a| (a.tab_id.clone(), a.pane_id.clone()));
-            let linked = wt.is_some_and(|t| t.is_linked_worktree) || checkout_is_linked(&probe);
+            let linked =
+                wt.is_some_and(|t| t.is_linked_worktree) || mem.linked_checkouts.contains(&probe);
             let checkout_name = std::path::Path::new(&probe)
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -889,7 +918,10 @@ fn snapshot(
             .unwrap_or_default();
         // ponytail: djb2 hash -> stable per-project hue; semantic green/red
         // excluded so state color is never ambiguous.
-        let member_ids: Vec<&str> = members.keys().map(String::as_str).collect();
+        let member_ids: Vec<&str> = match key {
+            PJKey::Repo(_) => members.keys().map(String::as_str).collect(),
+            PJKey::Solo(ws_id) => vec![ws_id.as_str()],
+        };
         let ws_of = |m: &str| ws_by_id.get(m).copied();
         // Repo name: shared repo_name wins, then a member label, then the
         // repo path's parent (repo_key itself usually ends in `.git`).
@@ -917,17 +949,12 @@ fn snapshot(
         };
         let (pinned, focused, collapsed) = match key {
             PJKey::Repo(_) => (
-                member_ids.iter().any(|m| mem.pinned.contains(*m)),
+                mem.pinned.contains(&id),
                 member_ids
                     .iter()
                     .filter_map(|m| ws_of(m))
                     .any(|w| w.focused),
-                // Collapse prefs migrate: a merged project honors any
-                // member's old workspace key.
-                mem.collapsed_projects.contains(&id)
-                    || member_ids
-                        .iter()
-                        .any(|m| mem.collapsed_projects.contains(*m)),
+                mem.collapsed_projects.contains(&id),
             ),
             PJKey::Solo(_) => (
                 mem.pinned.contains(&id),
@@ -966,7 +993,7 @@ fn snapshot(
             .then_with(|| score(a).cmp(&score(b)))
             .then_with(|| a.name.cmp(&b.name))
     });
-    (projects, None)
+    Ok(projects)
 }
 
 /// Stable per-project palette index (djb2 over the workspace id). One helper
@@ -1244,13 +1271,6 @@ fn load_state(mem: &mut Memory) {
         .and_then(|x| x.as_str())
         .unwrap_or("auto")
         .to_string();
-    if let Some(obj) = v.get("activity").and_then(|x| x.as_object()) {
-        for (k, val) in obj {
-            if let Some(t) = val.as_u64() {
-                mem.activity.insert(k.clone(), t);
-            }
-        }
-    }
 }
 
 /// Fold/unfold removals shared across instances: an unpin in one dock vetoes
@@ -1306,7 +1326,7 @@ fn save_state(mem: &mut Memory, force: bool) {
     mem.dirty_state = false;
     // Merge with the file: a dock in another native session may have saved
     // folds or pins since our load.
-    // Union for adds, max for stamps. Removals are SHARED vetoes: adopt the
+    // Union for adds. Removals are SHARED vetoes: adopt the
     // file's dropped set (another dock's unpin applies here too), republish
     // the merge, prune vetoes nothing holds anymore. Explicit holds here
     // (touched) overrule adopted vetoes, so a deliberate re-pin sticks.
@@ -1339,23 +1359,10 @@ fn save_state(mem: &mut Memory, force: bool) {
         }
         out.into_iter().collect::<Vec<_>>()
     };
-    // Stamps merge by max: the newest observation wins regardless of writer.
-    let mut activity = mem.activity.clone();
-    if let Some(obj) = file.get("activity").and_then(|x| x.as_object()) {
-        for (k, val) in obj {
-            if let Some(t) = val.as_u64() {
-                activity
-                    .entry(k.clone())
-                    .and_modify(|e| *e = (*e).max(t))
-                    .or_insert(t);
-            }
-        }
-    }
     let v = serde_json::json!({
         "collapsed_projects": union("collapsed_projects", "c", &mem.collapsed_projects),
         "collapsed_worktrees": union("collapsed_worktrees", "w", &mem.collapsed_worktrees),
         "pinned": union("pinned", "p", &mem.pinned),
-        "activity": activity,
         "font_choice": mem.font_choice,
         "dropped": mem.dropped.iter().collect::<Vec<_>>(),
     });
@@ -1372,20 +1379,11 @@ fn save_state(mem: &mut Memory, force: bool) {
     }
 }
 
-/// True when the id can be passed as a positional CLI argument without any
-/// risk of being parsed as a flag. Server-issued ids match this; anything
-/// else is refused rather than executed.
-fn is_flag_safe(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == ':' || c == '_' || c == '-')
-}
-
 /// Native pane navigation also works if agent detection changes after rendering.
-fn focus_session(pane_id: &str) -> io::Result<()> {
-    crate::ipc::call("pane.focus", serde_json::json!({ "pane_id": pane_id })).map(|_| ())
+fn focus_session(session: &crate::ipc::Session, pane_id: &str) -> io::Result<()> {
+    session
+        .call("pane.focus", serde_json::json!({ "pane_id": pane_id }))
+        .map(|_| ())
 }
 
 // ---------- Tree ----------
@@ -1458,7 +1456,7 @@ fn visible(projects: &[Project], query: &str, compact: bool, view: View) -> Vec<
     rows
 }
 /// Visual line -> row mapping for the current page: None entries are
-/// non-selectable padding (one blank under the toolbar, one between groups).
+/// non-selectable padding (one blank at the top, one between groups).
 /// A worktree stays attached to its project header; the gap opens only above
 /// later worktrees and above every project. Agents always sit directly under
 /// their worktree.
@@ -1467,7 +1465,7 @@ fn visual_rows_for_page(rows: &[Row], offset: usize, height: usize) -> Vec<Optio
         return Vec::new();
     }
     let mut vis = Vec::with_capacity(height);
-    vis.push(None); // breathing room under the toolbar
+    vis.push(None); // breathing room above the tree
     let mut first = true;
     for (idx, row) in rows.iter().enumerate().skip(offset) {
         let follows_project = match vis.last() {
@@ -1504,7 +1502,7 @@ fn window_for_selected(
     selected: usize,
 ) -> (Vec<Option<usize>>, usize) {
     let mut vis = visual_rows_for_page(rows, offset, height);
-    if height >= 2 {
+    if height >= 2 && selected < rows.len() {
         while !vis.contains(&Some(selected)) && offset + 1 < rows.len() {
             offset += 1;
             vis = visual_rows_for_page(rows, offset, height);
@@ -1513,10 +1511,10 @@ fn window_for_selected(
     (vis, offset)
 }
 
-/// Map a mouse y (absolute terminal row, toolbar at row 0, content from row 1)
-/// to a row index through the current visual mapping. Padding hits None.
+/// Map a mouse y (absolute terminal row, content from row 0) through the
+/// current visual mapping. Padding and the bottom toolbar hit None.
 fn visual_hit(vis: &[Option<usize>], y: u16) -> Option<usize> {
-    vis.get(y.saturating_sub(1) as usize).copied().flatten()
+    vis.get(y as usize).copied().flatten()
 }
 
 /// Which modal control a click lands on. Button precedence mirrors the
@@ -1652,11 +1650,21 @@ impl Drop for TermGuard {
 pub fn run() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--dump-snapshot") {
-        let mut mem = Memory::default();
+        let mut mem = Memory {
+            activity: ActivityStore::new(crate::config::state_dir().join("dock")),
+            ..Memory::default()
+        };
         load_state(&mut mem);
         let font = use_font(&mem.font_choice, font_ok());
         let theme = load_theme();
-        let (projects, err) = snapshot(&mut mem, &theme.projects, font);
+        let result = (|| {
+            let snap = crate::ipc::session_snapshot()?;
+            install_snapshot(&snap, &mut mem, &theme.projects, font)
+        })();
+        let (projects, err) = match result {
+            Ok(projects) => (projects, None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        };
         let rows = visible(&projects, "", false, View::Grouped);
         let dump: Vec<serde_json::Value> = projects
             .iter()
@@ -1682,7 +1690,10 @@ pub fn run() -> io::Result<()> {
         return Ok(());
     }
 
-    let mut mem = Memory::default();
+    let mut mem = Memory {
+        activity: ActivityStore::new(crate::config::state_dir().join("dock")),
+        ..Memory::default()
+    };
     load_state(&mut mem);
     // Glyph set: explicit choice wins, auto detects once. The notice below
     // is the install prompt: it explains what the font is for and remembers.
@@ -1701,11 +1712,16 @@ pub fn run() -> io::Result<()> {
     let mut more_btn = ratatui::layout::Rect::default();
     let mut row_rects = [ratatui::layout::Rect::default(); 10];
     let mut theme = load_theme();
-    let (mut projects, mut sync_error) = snapshot(&mut mem, &theme.projects, font);
-    let mut last_snapshot = std::time::Instant::now();
-    let mut selected = 0usize;
+    let mut sync = crate::ipc::SnapshotSync::new();
+    let mut projects: Vec<Project> = Vec::new();
+    let mut session: Option<crate::ipc::Session> = None;
+    let mut sync_error: Option<String> = None;
+    let mut last_config = std::time::Instant::now();
+    let mut last_tick = std::time::Instant::now();
+    let mut selected = NO_SELECTION;
     let mut browsing = false;
-    let mut pressed: Option<((u8, String), Activation)> = None;
+    let mut pressed: Option<(u8, String)> = None;
+    let mut pending_activation: Option<PendingActivation> = None;
     let mut offset = 0usize;
     let mut tick = 0usize;
     let mut hover: Option<usize> = None;
@@ -1738,61 +1754,100 @@ pub fn run() -> io::Result<()> {
     // never leave raw mode + alternate screen + mouse capture armed. (Panics
     // take the hook above.) State loss is bounded by the 5s debounced save.
     let _term_guard = TermGuard;
-    // First frame seats before the loop: otherwise the underline (rendered
-    // from the initial snapshot) leads the cursor by a full poll interval.
-    {
-        let focused_pane = projects
-            .iter()
-            .flat_map(|p| p.worktrees.iter())
-            .flat_map(|w| w.agents.iter())
-            .find(|a| a.focused)
-            .map(|a| a.pane_id.clone());
-        let rows = visible(&projects, &query, compact, view);
-        if let Some(idx) = seat_row(&projects, &rows, focused_pane.as_deref()) {
-            selected = idx;
-        }
-    }
     loop {
-        // Preserve browsing identity when native activity reorders rows.
-        if last_snapshot.elapsed() >= SNAPSHOT_MIN_AGE {
-            let previous_rows = visible(&projects, &query, compact, view);
-            let selected_key = row_key(&projects, &previous_rows, selected)
-                .map(|(kind, id)| (kind, id.to_owned()));
+        if last_config.elapsed() >= Duration::from_secs(1) {
             if !settings_dialog {
                 settings_obj = crate::config::load()?;
             }
             theme = load_theme();
-            let (fresh, err) = snapshot(&mut mem, &theme.projects, font);
-            let current_focused = fresh
-                .iter()
-                .flat_map(|p| p.worktrees.iter())
-                .flat_map(|w| w.agents.iter())
-                .find(|a| a.focused)
-                .map(|a| a.pane_id.clone());
-            projects = fresh;
-            sync_error = err;
-            let current_rows = visible(&projects, &query, compact, view);
-            let preserved = selected_key
-                .as_ref()
-                .and_then(|(kind, id)| row_index(&projects, &current_rows, (*kind, id.as_str())));
-            selected = if browsing || filtering || settings_dialog || confirm_close.is_some() {
-                preserved.unwrap_or(selected.min(current_rows.len().saturating_sub(1)))
-            } else {
-                seat_row(&projects, &current_rows, current_focused.as_deref())
-                    .or(preserved)
-                    .unwrap_or(0)
-            };
-            last_snapshot = std::time::Instant::now();
+            for project in &mut projects {
+                project.icon_color =
+                    theme.projects[project_hue(&project.id) % theme.projects.len()];
+                project.icon = if font { '' } else { '#' };
+            }
+            last_config = std::time::Instant::now();
         }
+        let refresh = sync.poll().and_then(|snap| {
+            let Some(snap) = snap else { return Ok(None) };
+            let fresh = install_snapshot(&snap, &mut mem, &theme.projects, font)?;
+            Ok(Some((snap.session, fresh)))
+        });
+        match refresh {
+            Ok(Some((fresh_session, fresh))) => {
+                if session.as_ref().map(crate::ipc::Session::key) != Some(fresh_session.key()) {
+                    selected = NO_SELECTION;
+                    pressed = None;
+                    pending_activation = None;
+                    confirm_close = None;
+                    browsing = false;
+                    offset = 0;
+                }
+                let previous_rows = visible(&projects, &query, compact, view);
+                let key = row_key(&projects, &previous_rows, selected)
+                    .map(|(kind, id)| (kind, id.to_owned()));
+                projects = fresh;
+                session = Some(fresh_session);
+                let current_rows = visible(&projects, &query, compact, view);
+                selected = restore_selection(
+                    &projects,
+                    &current_rows,
+                    key.as_ref().map(|(kind, id)| (*kind, id.as_str())),
+                    browsing || filtering || settings_dialog || confirm_close.is_some(),
+                );
+                if selected == NO_SELECTION {
+                    confirm_close = None;
+                }
+                hover = None;
+                if pending_activation.as_ref().is_some_and(|intent| {
+                    row_index(&projects, &current_rows, (intent.key.0, &intent.key.1)).is_none()
+                }) {
+                    pending_activation = None;
+                    selected = NO_SELECTION;
+                }
+                sync_error = None;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                sync_error = Some(error.to_string());
+                pressed = None;
+                pending_activation = None;
+                confirm_close = None;
+                sync.invalidate();
+            }
+        }
+        let activity_error = mem
+            .activity
+            .save(false)
+            .err()
+            .map(|error| error.to_string());
         save_state(&mut mem, false);
         let rows = visible(&projects, &query, compact, view);
-        if selected >= rows.len() {
+        if !sync.is_stale() && sync_error.is_none() {
+            if let Some(intent) = pending_activation.take() {
+                if let Some((idx, target)) = intent.resolve(&projects, &rows) {
+                    selected = idx;
+                    browsing = false;
+                    if let Some(session) = &session {
+                        if let Err(error) = activate_target(session, target) {
+                            status_line = error.to_string();
+                        }
+                        sync.invalidate();
+                    }
+                } else {
+                    selected = NO_SELECTION;
+                }
+            }
+        }
+        if selected != NO_SELECTION && selected >= rows.len() {
             selected = rows.len().saturating_sub(1);
         }
-        let height = term.size()?.height.saturating_sub(2) as usize;
+        let height = term.size()?.height.saturating_sub(1) as usize;
         // Clamp the window itself: when rows shrink under a high offset the
         // viewport would otherwise anchor on the last row and draw blanks.
-        offset = ensure_visible(selected, offset, height).min(rows.len().saturating_sub(height));
+        if selected != NO_SELECTION {
+            offset = ensure_visible(selected, offset, height);
+        }
+        offset = offset.min(rows.len().saturating_sub(height));
         let working = rows.iter().any(|r| match *r {
             Row::Agent(pi, wi, ai) => {
                 let (g, anim) = state_glyph(projects[pi].worktrees[wi].agents[ai].state, 0, font);
@@ -1802,7 +1857,7 @@ pub fn run() -> io::Result<()> {
             _ => false,
         });
         let step = if working { tick % SPINNER.len() } else { 0 };
-        let sig = signature(&SigInput {
+        let mut sig = signature(&SigInput {
             projects: &projects,
             rows: &rows,
             selected,
@@ -1822,6 +1877,10 @@ pub fn run() -> io::Result<()> {
             settings_row,
             settings_obj: &settings_obj,
         });
+        sig.push_str(&format!(
+            "{sync_error:?}:{activity_error:?}:{}",
+            sync.is_stale()
+        ));
         if sig != last_drawn {
             let (agents, working_n, blocked, unread) = counts(&projects);
             // First visible agent row per tab, in display order: drives the
@@ -2006,23 +2065,7 @@ pub fn run() -> io::Result<()> {
                 if area.height == 0 || area.width == 0 {
                     return;
                 }
-                // Top Toolbar (Row 0)
-                let btn_text = " [⚙ Settings] ";
-                let btn_w = btn_text.chars().count() as u16;
-                let btn_x = area.right().saturating_sub(btn_w);
-                settings_btn = ratatui::layout::Rect::new(btn_x, area.y, btn_w, 1);
-                let title_text = format!(" {agents} agents · {working_n} working · {blocked} blocked · {unread} unread");
-                let title_w = area.width.saturating_sub(btn_w);
-                f.render_widget(
-                    Paragraph::new(title_text).style(Style::default().fg(theme.working).add_modifier(Modifier::BOLD)),
-                    ratatui::layout::Rect::new(area.x, area.y, title_w, 1),
-                );
-                f.render_widget(
-                    Paragraph::new(btn_text).style(Style::default().fg(theme.idle_fresh).add_modifier(Modifier::BOLD)),
-                    settings_btn,
-                );
-
-                // Content lines (Rows 1 .. height)
+                // Content above the bottom toolbar.
                 // When settings is open, dim the background so the modal reads crisply.
                 let bg_dim = if settings_dialog { Modifier::DIM } else { Modifier::empty() };
                 let dim_lines: Vec<Line> = lines.iter().map(|l| {
@@ -2030,35 +2073,48 @@ pub fn run() -> io::Result<()> {
                     for s in &mut nl.spans { s.style = s.style.add_modifier(bg_dim); }
                     nl
                 }).collect();
-                let content_h = area.height.saturating_sub(2);
-                let content_rect = ratatui::layout::Rect::new(area.x, area.y + 1, area.width, content_h);
+                let content_h = area.height.saturating_sub(1);
+                let content_rect = ratatui::layout::Rect::new(area.x, area.y, area.width, content_h);
                 f.render_widget(Paragraph::new(dim_lines), content_rect);
 
-                // Footer line
-                let resize_hint = "[ / ] width";
+                // Bottom toolbar: transient messages replace the summary, not Settings.
+                let footer_y = area.bottom().saturating_sub(1);
+                let btn_text = " [⚙ Settings] ";
+                let btn_w = (btn_text.chars().count() as u16).min(area.width);
+                settings_btn = ratatui::layout::Rect::new(area.right() - btn_w, footer_y, btn_w, 1);
+                let mut footer_style = Style::default().fg(theme.dim);
                 let bottom = if let Some(e) = sync_error.as_deref() {
                     format!("herdr unreachable: {e} (retrying)")
+                } else if sync.is_stale() {
+                    "refreshing Herdr snapshot".into()
                 } else if filtering {
                     format!("filter: {query}  (enter/esc done)")
                 } else if !status_line.is_empty() {
                     status_line.clone()
+                } else if let Some(error) = &activity_error {
+                    format!("activity save failed: {error}")
                 } else if font_notice {
                     "Nerd Font not found - ASCII icons - F font options".into()
                 } else {
-                    format!("{agents} agents · {working_n} working · {blocked} blocked · {unread} unread | s ⚙ settings · {resize_hint} · / filter · v order · c compact · q quit")
+                    footer_style = Style::default().fg(theme.working).add_modifier(Modifier::BOLD);
+                    format!(" {agents} agents · {working_n} working · {blocked} blocked · {unread} unread")
                 };
-                let footer_rect = ratatui::layout::Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
+                let footer_rect = ratatui::layout::Rect::new(area.x, footer_y, area.width - btn_w, 1);
                 f.render_widget(
-                    Paragraph::new(bottom).style(Style::default().fg(theme.dim)),
+                    Paragraph::new(bottom).style(footer_style),
                     footer_rect,
                 );
+                f.render_widget(
+                    Paragraph::new(btn_text).style(Style::default().fg(theme.idle_fresh).add_modifier(Modifier::BOLD)),
+                    settings_btn,
+                );
 
-                // Settings Dialog: anchored under the top-right Settings button.
+                // Settings dialog opens above its bottom-right button.
                 if settings_dialog {
-                    let card_w = area.width.saturating_sub(2).clamp(24, 58);
-                    let card_h = area.height.saturating_sub(4).clamp(12, 28);
+                    let card_w = area.width.saturating_sub(2).clamp(24, 58).min(area.width);
+                    let card_h = area.height.saturating_sub(4).clamp(12, 28).min(content_h);
                     let card_x = area.right().saturating_sub(card_w);
-                    let card_y = area.y + 2;
+                    let card_y = footer_y.saturating_sub(card_h).max(area.y);
                     let card_rect = ratatui::layout::Rect::new(card_x, card_y, card_w, card_h);
                     f.render_widget(ratatui::widgets::Clear, card_rect);
                     let vals = crate::settings::values(&settings_obj);
@@ -2164,17 +2220,30 @@ pub fn run() -> io::Result<()> {
             last_drawn = sig;
         }
 
-        // Deadline-driven wait: spinner cadence only while working, long idle
-        // sleep otherwise. Input and mouse interrupt immediately either way.
-        if !event::poll(if working { TICK } else { IDLE_POLL })? {
-            if working {
-                tick += 1;
+        // Keep the animation deadline independent of event synchronization.
+        let wait = if working {
+            TICK.saturating_sub(last_tick.elapsed())
+        } else {
+            IDLE_POLL
+        }
+        .min(crate::ipc::SYNC_CHECK_INTERVAL);
+        if !event::poll(wait)? {
+            if working && last_tick.elapsed() >= TICK {
+                tick = tick.wrapping_add(1);
+                last_tick = std::time::Instant::now();
             }
             continue;
         }
         match event::read()? {
             Event::Key(key) if key.kind != crossterm::event::KeyEventKind::Release => {
                 pressed = None;
+                if !matches!(key.code, KeyCode::Enter | KeyCode::Char('o'))
+                    || filtering
+                    || settings_dialog
+                    || font_dialog
+                {
+                    pending_activation = None;
+                }
                 // Fresh key input replaces the previous message (each arm sets
                 // its own); mouse motion/resize must not eat lifecycle
                 status_line.clear();
@@ -2262,27 +2331,38 @@ pub fn run() -> io::Result<()> {
                         _ => {}
                     }
                     // Rescan or switch: repaint from the new set immediately.
-                    last_snapshot = last_snapshot
-                        .checked_sub(SNAPSHOT_MIN_AGE * 2)
-                        .unwrap_or(last_snapshot);
+                    sync.invalidate();
+                    continue;
+                }
+                if matches!(key.code, KeyCode::Enter | KeyCode::Char('o' | 'D' | 'N'))
+                    && (sync_error.is_some()
+                        || session.is_none()
+                        || (sync.is_stale() && matches!(key.code, KeyCode::Char('D' | 'N'))))
+                {
+                    pending_activation = None;
+                    confirm_close = None;
                     continue;
                 }
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Enter => {
-                        if selected < rows.len() {
-                            browsing = false;
-                            if let Err(error) = activate(&projects, &rows, selected) {
-                                status_line = error.to_string();
-                            }
-                        }
+                    KeyCode::Enter | KeyCode::Char('o') => {
+                        pending_activation = PendingActivation::new(
+                            &projects,
+                            &rows,
+                            selected,
+                            key.code == KeyCode::Char('o'),
+                        );
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        selected = (selected + 1).min(rows.len().saturating_sub(1));
+                        selected = if selected == NO_SELECTION {
+                            0
+                        } else {
+                            selected.saturating_add(1).min(rows.len().saturating_sub(1))
+                        };
                         browsing = true;
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
-                        selected = selected.saturating_sub(1);
+                        selected = selected.min(rows.len()).saturating_sub(1);
                         browsing = true;
                     }
                     KeyCode::Left | KeyCode::Char('h') => {
@@ -2335,52 +2415,16 @@ pub fn run() -> io::Result<()> {
                             _ => false,
                         };
                         if n > 0 {
-                            if let Some(off) = (1..=n).find(|k| is_att(&rows[(selected + k) % n])) {
-                                selected = (selected + off) % n;
+                            let start = if selected == NO_SELECTION {
+                                n - 1
+                            } else {
+                                selected % n
+                            };
+                            if let Some(off) = (1..=n).find(|k| is_att(&rows[(start + k) % n])) {
+                                selected = (start + off) % n;
                                 browsing = true;
                             } else {
                                 status_line = "no blocked or unacked rows".into();
-                            }
-                        }
-                    }
-                    KeyCode::Char('o') => {
-                        if let Some(r) = rows.get(selected) {
-                            // Native workspace ids only: merged project keys
-                            // (repo:...) are view identity, not Herdr identity.
-                            let (id, name) = match *r {
-                                Row::Project(pi) => (
-                                    projects
-                                        .get(pi)
-                                        .and_then(|p| p.workspaces.first())
-                                        .cloned()
-                                        .unwrap_or_default(),
-                                    projects.get(pi).map(|p| p.name.clone()).unwrap_or_default(),
-                                ),
-                                Row::Worktree(pi, wi) => (
-                                    projects
-                                        .get(pi)
-                                        .and_then(|p| p.worktrees.get(wi))
-                                        .map(|w| w.workspace_id.clone())
-                                        .unwrap_or_default(),
-                                    projects.get(pi).map(|p| p.name.clone()).unwrap_or_default(),
-                                ),
-                                Row::Agent(pi, wi, ai) => (
-                                    projects
-                                        .get(pi)
-                                        .and_then(|p| p.worktrees.get(wi))
-                                        .and_then(|w| w.agents.get(ai))
-                                        .map(|a| a.workspace_id.clone())
-                                        .unwrap_or_default(),
-                                    projects.get(pi).map(|p| p.name.clone()).unwrap_or_default(),
-                                ),
-                            };
-                            match focus_workspace(&id) {
-                                Ok(()) => {
-                                    status_line = format!("focused {name}");
-                                }
-                                Err(e) => {
-                                    status_line = format!("focus failed: {name} {e}");
-                                }
                             }
                         }
                     }
@@ -2406,6 +2450,7 @@ pub fn run() -> io::Result<()> {
                         }
                     }
                     KeyCode::Char('D') => {
+                        let Some(session) = &session else { continue };
                         if let Some(r) = rows.get(selected) {
                             // Native workspace ids: a merged header closes all
                             // its member spaces, a worktree/agent row its own.
@@ -2455,19 +2500,12 @@ pub fn run() -> io::Result<()> {
                                 let mut closed = 0;
                                 let mut failed = 0;
                                 for ws in &wss {
-                                    if !is_flag_safe(ws) {
-                                        failed += 1;
-                                        continue;
-                                    }
-                                    let ok = crate::ipc::call(
-                                        "workspace.close",
-                                        serde_json::json!({ "workspace_id": ws }),
-                                    )
-                                    .is_ok()
-                                        || Command::new(herdr_bin())
-                                            .args(["workspace", "close", ws])
-                                            .output()
-                                            .is_ok_and(|o| o.status.success());
+                                    let ok = session
+                                        .call(
+                                            "workspace.close",
+                                            serde_json::json!({ "workspace_id": ws }),
+                                        )
+                                        .is_ok();
                                     if ok {
                                         closed += 1;
                                     } else {
@@ -2476,10 +2514,6 @@ pub fn run() -> io::Result<()> {
                                 }
                                 if failed == 0 {
                                     status_line = format!("closed {name}");
-                                    // Force a refresh past the 1s floor.
-                                    last_snapshot = last_snapshot
-                                        .checked_sub(SNAPSHOT_MIN_AGE * 2)
-                                        .unwrap_or(last_snapshot);
                                 } else if closed == 0 {
                                     status_line = format!("close failed: {name}");
                                 } else {
@@ -2487,6 +2521,7 @@ pub fn run() -> io::Result<()> {
                                         format!("closed {closed}, failed {failed}: {name}");
                                 }
                                 confirm_close = None;
+                                sync.invalidate();
                             } else {
                                 confirm_close = Some(wss);
                                 status_line =
@@ -2495,20 +2530,16 @@ pub fn run() -> io::Result<()> {
                         }
                     }
                     KeyCode::Char('N') => {
-                        let created = crate::ipc::call("workspace.create", serde_json::json!({}))
-                            .is_ok()
-                            || Command::new(herdr_bin())
-                                .args(["workspace", "create"])
-                                .output()
-                                .is_ok_and(|o| o.status.success());
+                        let Some(session) = &session else { continue };
+                        let created = session
+                            .call("workspace.create", serde_json::json!({}))
+                            .is_ok();
                         if created {
                             status_line = "workspace created".into();
-                            last_snapshot = last_snapshot
-                                .checked_sub(SNAPSHOT_MIN_AGE * 2)
-                                .unwrap_or(last_snapshot);
                         } else {
                             status_line = "workspace create failed".into();
                         }
+                        sync.invalidate();
                     }
                     _ => {}
                 }
@@ -2516,6 +2547,7 @@ pub fn run() -> io::Result<()> {
             Event::Mouse(m) => match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
                     pressed = None;
+                    pending_activation = None;
                     confirm_close = None;
                     if settings_dialog {
                         match modal_hit(m.column, m.row, close_btn, less_btn, more_btn, &row_rects)
@@ -2560,20 +2592,16 @@ pub fn run() -> io::Result<()> {
                             hover = None;
                             browsing = true;
                             pressed = row_key(&projects, &rows, idx)
-                                .map(|(kind, id)| (kind, id.to_owned()))
-                                .zip(activation_target(&projects, &rows, idx));
+                                .map(|(kind, id)| (kind, id.to_owned()));
                         }
                     }
                 }
                 MouseEventKind::Up(MouseButton::Left) => {
-                    if let Some(((kind, id), target)) = pressed.take() {
-                        let released = visual_hit(&visual_rows, m.row)
-                            .and_then(|idx| row_key(&projects, &rows, idx));
-                        if released == Some((kind, id.as_str())) {
-                            browsing = false;
-                            if let Err(error) = activate_target(target) {
-                                status_line = error.to_string();
-                            }
+                    pending_activation = None;
+                    if let Some((kind, id)) = pressed.take() {
+                        if sync_error.is_none() && session.is_some() {
+                            pending_activation = visual_hit(&visual_rows, m.row)
+                                .and_then(|idx| release_target(&projects, &rows, (kind, &id), idx));
                         }
                     }
                 }
@@ -2589,22 +2617,28 @@ pub fn run() -> io::Result<()> {
                     }
                 }
                 MouseEventKind::ScrollDown => {
+                    pending_activation = None;
                     if settings_dialog {
                         settings_row =
                             (settings_row + 1).min(crate::settings::LABELS.len().saturating_sub(1));
                     } else {
                         confirm_close = None;
-                        selected = (selected + 3).min(rows.len().saturating_sub(1));
+                        selected = if selected == NO_SELECTION {
+                            0
+                        } else {
+                            selected.saturating_add(3).min(rows.len().saturating_sub(1))
+                        };
                         pressed = None;
                         browsing = true;
                     }
                 }
                 MouseEventKind::ScrollUp => {
+                    pending_activation = None;
                     if settings_dialog {
                         settings_row = settings_row.saturating_sub(1);
                     } else {
                         confirm_close = None;
-                        selected = selected.saturating_sub(3);
+                        selected = selected.min(rows.len()).saturating_sub(3);
                         pressed = None;
                         browsing = true;
                     }
@@ -2616,21 +2650,26 @@ pub fn run() -> io::Result<()> {
     }
 
     save_state(&mut mem, true);
+    mem.activity.save(true)?;
     disable_raw_mode()?;
     execute!(
         term.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture
     )?;
-    crate::native::dock_command(crate::dock_control::Command::Close)
+    match session {
+        Some(session) => crate::native::dock_command(crate::dock_control::Command::Close, &session),
+        None => Ok(()),
+    }
 }
 
-fn focus_workspace(workspace_id: &str) -> io::Result<()> {
-    crate::ipc::call(
-        "workspace.focus",
-        serde_json::json!({ "workspace_id": workspace_id }),
-    )
-    .map(|_| ())
+fn focus_workspace(session: &crate::ipc::Session, workspace_id: &str) -> io::Result<()> {
+    session
+        .call(
+            "workspace.focus",
+            serde_json::json!({ "workspace_id": workspace_id }),
+        )
+        .map(|_| ())
 }
 
 fn fold_at(projects: &mut [Project], mem: &mut Memory, rows: &[Row], idx: usize, collapsed: bool) {
@@ -2687,21 +2726,62 @@ fn activation_target(projects: &[Project], rows: &[Row], idx: usize) -> Option<A
             .get(pi)
             .and_then(|p| p.worktrees.get(wi))
             .and_then(|w| w.agents.get(ai))
+            .filter(|a| !a.terminal_id.is_empty() && !a.pane_id.is_empty())
             .map(|a| Activation::Session(a.pane_id.clone())),
     }
 }
 
-fn activate(projects: &[Project], rows: &[Row], idx: usize) -> io::Result<()> {
-    match activation_target(projects, rows, idx) {
-        Some(target) => activate_target(target),
-        None => Ok(()),
+fn release_target(
+    projects: &[Project],
+    rows: &[Row],
+    pressed: (u8, &str),
+    released: usize,
+) -> Option<PendingActivation> {
+    if row_key(projects, rows, released) != Some(pressed) {
+        return None;
+    }
+    PendingActivation::new(projects, rows, released, false)
+}
+
+/// Keep one row identity, not the native address it had before a refresh.
+struct PendingActivation {
+    key: (u8, String),
+    workspace_only: bool,
+}
+
+impl PendingActivation {
+    fn new(projects: &[Project], rows: &[Row], idx: usize, workspace_only: bool) -> Option<Self> {
+        let (kind, id) = row_key(projects, rows, idx)?;
+        Some(Self {
+            key: (kind, id.to_owned()),
+            workspace_only,
+        })
+    }
+
+    fn resolve(&self, projects: &[Project], rows: &[Row]) -> Option<(usize, Activation)> {
+        let idx = row_index(projects, rows, (self.key.0, &self.key.1))?;
+        let target = if self.workspace_only {
+            match rows[idx] {
+                Row::Agent(pi, wi, ai) => {
+                    let id = &projects[pi].worktrees[wi].agents[ai].workspace_id;
+                    if id.is_empty() {
+                        return None;
+                    }
+                    Activation::Space(id.clone())
+                }
+                _ => activation_target(projects, rows, idx)?,
+            }
+        } else {
+            activation_target(projects, rows, idx)?
+        };
+        Some((idx, target))
     }
 }
 
-fn activate_target(target: Activation) -> io::Result<()> {
+fn activate_target(session: &crate::ipc::Session, target: Activation) -> io::Result<()> {
     match target {
-        Activation::Space(ws) => focus_workspace(&ws),
-        Activation::Session(pane) => focus_session(&pane),
+        Activation::Space(ws) => focus_workspace(session, &ws),
+        Activation::Session(pane) => focus_session(session, &pane),
     }
 }
 
@@ -2834,6 +2914,169 @@ mod tests {
     }
 
     #[test]
+    fn browsing_follows_terminal_moves_but_never_reuses_a_removed_row() {
+        let mut projects = stub();
+        let old_rows = visible(&projects, "", false, View::Grouped);
+        let old_index = row_index(&projects, &old_rows, (2, "alpha")).unwrap();
+        projects[0].worktrees[0].agents[0].pane_id = "w9:p8".into();
+        projects[0].worktrees[0].agents.swap(0, 1);
+        let rows = visible(&projects, "", false, View::Grouped);
+        let selected = restore_selection(&projects, &rows, Some((2, "alpha")), true);
+        assert_eq!(
+            activation_target(&projects, &rows, selected),
+            Some(Activation::Session("w9:p8".into()))
+        );
+        projects[0].worktrees[0]
+            .agents
+            .retain(|a| a.terminal_id != "alpha");
+        let rows = visible(&projects, "", false, View::Grouped);
+        assert_eq!(
+            activation_target(&projects, &rows, old_index),
+            Some(Activation::Session("w1:p2".into()))
+        );
+        let selected = restore_selection(&projects, &rows, Some((2, "alpha")), true);
+        assert_eq!(selected, NO_SELECTION);
+        assert_eq!(activation_target(&projects, &rows, selected), None);
+        assert_eq!(
+            restore_selection(&projects, &rows, None, true),
+            NO_SELECTION
+        );
+    }
+
+    #[test]
+    fn held_header_click_resolves_current_workspace_and_checks_release_identity() {
+        let mut projects = stub();
+        projects[0].workspaces = vec!["old-workspace".into()];
+        let rows = visible(&projects, "", false, View::Grouped);
+        let header = row_index(&projects, &rows, (0, "stub-a")).unwrap();
+        assert_eq!(
+            activation_target(&projects, &rows, header),
+            Some(Activation::Space("old-workspace".into()))
+        );
+        let pending = release_target(&projects, &rows, (0, "stub-a"), header).unwrap();
+        projects[0].workspaces = vec!["current-workspace".into()];
+        assert_eq!(
+            pending.resolve(&projects, &rows).map(|(_, target)| target),
+            Some(Activation::Space("current-workspace".into()))
+        );
+        let other = row_index(&projects, &rows, (0, "stub-b")).unwrap();
+        assert!(release_target(&projects, &rows, (0, "stub-a"), other).is_none());
+    }
+
+    #[test]
+    fn pending_activation_follows_terminal_moves_without_numeric_fallback() {
+        let mut projects = stub();
+        let rows = visible(&projects, "", false, View::Grouped);
+        let idx = row_index(&projects, &rows, (2, "alpha")).unwrap();
+        let pending = PendingActivation::new(&projects, &rows, idx, false).unwrap();
+        let workspace = PendingActivation::new(&projects, &rows, idx, true).unwrap();
+        projects[0].worktrees[0].agents[0].pane_id = "w9:p8".into();
+        projects[0].worktrees[0].agents[0].workspace_id = "w9".into();
+        projects[0].worktrees[0].agents.swap(0, 1);
+        let rows = visible(&projects, "", false, View::Grouped);
+        assert_eq!(
+            pending.resolve(&projects, &rows).map(|(_, target)| target),
+            Some(Activation::Session("w9:p8".into()))
+        );
+        assert_eq!(
+            workspace
+                .resolve(&projects, &rows)
+                .map(|(_, target)| target),
+            Some(Activation::Space("w9".into()))
+        );
+        projects[0].worktrees[0]
+            .agents
+            .retain(|a| a.terminal_id != "alpha");
+        let rows = visible(&projects, "", false, View::Grouped);
+        assert_eq!(pending.resolve(&projects, &rows), None);
+        assert_eq!(workspace.resolve(&projects, &rows), None);
+    }
+
+    #[test]
+    fn solo_cwd_groups_target_only_the_real_workspace() {
+        let snap = serde_json::json!({
+            "agents": [
+                {"terminal_id":"alpha", "pane_id":"w1:p1", "workspace_id":"w1", "cwd":"/one"},
+                {"terminal_id":"beta", "pane_id":"w1:p2", "workspace_id":"w1", "cwd":"/two"}
+            ],
+            "workspaces": [{"workspace_id":"w1", "label":"Solo",
+                "worktree":{"checkout_path":"/one", "repo_key":""}}]
+        });
+        let projects = snapshot(&snap, &Memory::default(), &[Color::Cyan], false, 0).unwrap();
+        assert_eq!(projects[0].workspaces, vec!["w1"]);
+        assert_eq!(projects[0].worktrees.len(), 2);
+        let rows = visible(&projects, "", false, View::Grouped);
+        for (idx, row) in rows.iter().enumerate() {
+            if matches!(row, Row::Project(_) | Row::Worktree(_, _)) {
+                assert_eq!(
+                    activation_target(&projects, &rows, idx),
+                    Some(Activation::Space("w1".into()))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn repo_pin_uses_canonical_identity_after_members_change() {
+        let mut snap = serde_json::json!({
+            "agents": [],
+            "workspaces": [{"workspace_id":"w1",
+                "worktree":{"repo_key":"/repo/.git", "checkout_path":"/repo"}}]
+        });
+        let mut mem = Memory::default();
+        let projects = snapshot(&snap, &mem, &[Color::Cyan], false, 0).unwrap();
+        mem.pinned.insert(projects[0].id.clone());
+        snap["workspaces"][0]["workspace_id"] = serde_json::json!("w2");
+        let projects = snapshot(&snap, &mem, &[Color::Cyan], false, 0).unwrap();
+        assert!(projects[0].pinned);
+        assert_eq!(projects[0].workspaces, vec!["w2"]);
+        mem.pinned.clear();
+        mem.pinned.insert("w2".into());
+        let projects = snapshot(&snap, &mem, &[Color::Cyan], false, 0).unwrap();
+        assert!(!projects[0].pinned);
+    }
+
+    #[test]
+    fn idle_history_follows_terminal_not_reused_pane_address() {
+        let mut mem = Memory::default();
+        mem.activity.mark_working("alpha", 1_000);
+        let snap = serde_json::json!({
+            "agents": [
+                {"terminal_id":"alpha", "pane_id":"w1:p9", "workspace_id":"w1", "agent_status":"idle"},
+                {"terminal_id":"beta", "pane_id":"w1:p1", "workspace_id":"w1", "agent_status":"idle"}
+            ],
+            "workspaces": [{"workspace_id":"w1"}]
+        });
+        let projects = snapshot(&snap, &mem, &[Color::Cyan], false, 2_000).unwrap();
+        let agents = &projects[0].worktrees[0].agents;
+        assert_eq!(
+            agents
+                .iter()
+                .find(|a| a.terminal_id == "alpha")
+                .unwrap()
+                .state,
+            State::IdleFresh
+        );
+        assert_eq!(
+            agents
+                .iter()
+                .find(|a| a.terminal_id == "beta")
+                .unwrap()
+                .state,
+            State::Idle
+        );
+        let mut malformed = snap.clone();
+        malformed["agents"][0]["terminal_id"] = serde_json::json!("");
+        assert!(snapshot(&malformed, &mem, &[Color::Cyan], false, 2_000).is_err());
+        malformed["agents"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("terminal_id");
+        assert!(snapshot(&malformed, &mem, &[Color::Cyan], false, 2_000).is_err());
+        assert_eq!(mem.freshness("alpha", 2_000), State::IdleFresh);
+    }
+
+    #[test]
     fn collapse_hides_children() {
         let mut projects = stub();
         let full = visible(&projects, "", false, View::Grouped).len();
@@ -2858,7 +3101,7 @@ mod tests {
         let rows = visible(&projects, "", false, View::Grouped);
         assert!(rows.len() > 2);
         let vis = visual_rows_for_page(&rows, 0, rows.len() + 4);
-        // One blank under the toolbar.
+        // One blank above the tree.
         assert_eq!(vis[0], None);
         assert_eq!(vis[1], Some(0));
         // Exactly one blank between the two projects.
@@ -2897,10 +3140,10 @@ mod tests {
             .unwrap();
         let ata = vis.iter().position(|v| *v == Some(ag)).unwrap();
         assert!(vis[ata - 1].is_some());
-        // Mouse hits: toolbar row and padding miss, first content row hits.
+        // Mouse hits: top padding misses, first row hits, toolbar below content misses.
         assert_eq!(visual_hit(&vis, 0), None);
-        assert_eq!(visual_hit(&vis, 1), None);
-        assert_eq!(visual_hit(&vis, 2), Some(0));
+        assert_eq!(visual_hit(&vis, 1), Some(0));
+        assert_eq!(visual_hit(&vis, vis.len() as u16), None);
         // Never overflows the content height.
         assert!(visual_rows_for_page(&rows, 0, 3).len() <= 3);
         assert!(visual_rows_for_page(&rows, 0, 0).is_empty());
@@ -2970,11 +3213,14 @@ mod tests {
     #[test]
     fn freshness_tiers_split_idle() {
         let mut mem = Memory::default();
-        mem.activity.insert("p1".into(), 1_000_000);
-        assert_eq!(mem.freshness("p1", 1_000_000 + 60), State::IdleFresh);
-        assert_eq!(mem.freshness("p1", 1_000_000 + 3600), State::Idle);
-        assert_eq!(mem.freshness("p1", 1_000_000 + 9000), State::IdleStale);
-        assert_eq!(mem.freshness(" unseen ", 1_000_000), State::Idle);
+        mem.activity.mark_working("terminal-alpha", 1_000_000);
+        assert_eq!(mem.freshness("terminal-alpha", 1_060_000), State::IdleFresh);
+        assert_eq!(mem.freshness("terminal-alpha", 4_600_000), State::Idle);
+        assert_eq!(
+            mem.freshness("terminal-alpha", 10_000_000),
+            State::IdleStale
+        );
+        assert_eq!(mem.freshness("unseen", 1_000_000), State::Idle);
     }
 
     #[test]
@@ -3041,20 +3287,6 @@ mod tests {
     }
 
     #[test]
-    fn socket_envelope_matches_cli_shape() {
-        let snap = serde_json::json!({"agents": [{"pane_id": "w1:p1"}], "workspaces": []});
-        let wrapped = envelope(&snap, "agents");
-        let agents = wrapped
-            .pointer("/result/agents")
-            .and_then(|v| v.as_array())
-            .unwrap();
-        assert_eq!(agents.len(), 1);
-        assert!(envelope(&snap, "missing")
-            .pointer("/result/missing")
-            .is_some());
-    }
-
-    #[test]
     fn ancestry_pins_main_and_nests_paths() {
         use std::collections::BTreeMap;
         let ws = |checkout: &str, root: &str| WorkspaceEntry {
@@ -3095,6 +3327,7 @@ mod tests {
     #[test]
     fn agent_title_prefers_native_metadata() {
         let mut e = AgentEntry {
+            terminal_id: "alpha".into(),
             agent: "claude".into(),
             agent_status: String::new(),
             pane_id: String::new(),

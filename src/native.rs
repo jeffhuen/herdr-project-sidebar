@@ -2,7 +2,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
@@ -18,10 +17,10 @@ use crate::{config, dock_control, icons, ipc};
 
 const SOURCE: &str = "plugin:herdr-project-sidebar";
 const SPIN_MS: u64 = 300;
-const POLL_INTERVAL: Duration = Duration::from_millis(300);
 const CONTROL_LIMIT: u64 = 8192;
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const READY_ENV: &str = "HERDR_PROJECT_SIDEBAR_READY";
+const RECOVERY_GRACE: Duration = Duration::from_secs(30);
 const COMMAND_START_ENV: &str = "HERDR_PROJECT_SIDEBAR_COMMAND_START";
 
 const KEYS: [&str; 17] = [
@@ -75,15 +74,7 @@ fn socket_path() -> io::Result<PathBuf> {
 }
 
 fn daemon_paths() -> io::Result<(PathBuf, PathBuf)> {
-    let socket = socket_path()?;
-    let socket = socket.canonicalize().unwrap_or(socket);
-    let hash = socket
-        .as_os_str()
-        .as_bytes()
-        .iter()
-        .fold(0xcbf29ce484222325u64, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-        });
+    let hash = ipc::socket_hash(&socket_path()?);
     let dir = config::state_dir();
     fs::DirBuilder::new()
         .recursive(true)
@@ -185,10 +176,11 @@ fn start_inner(await_command: bool) -> io::Result<()> {
 struct DockRequest {
     command: dock_control::Command,
     caller_tab_id: Option<String>,
+    session: String,
 }
 
-pub fn dock_command(command: dock_control::Command) -> io::Result<()> {
-    start_inner(true)?;
+pub fn dock_command(command: dock_control::Command, session: &ipc::Session) -> io::Result<()> {
+    session.check()?;
     let caller_tab_id = if !matches!(command, dock_control::Command::Toggle) {
         None
     } else if std::env::var_os("HERDR_PLUGIN_ACTION_ID").is_some() {
@@ -200,7 +192,7 @@ pub fn dock_command(command: dock_control::Command) -> io::Result<()> {
     } else {
         match std::env::var("HERDR_PANE_ID") {
             Ok(inherited) => {
-                let current = ipc::call("pane.current", json!({"caller_pane_id": inherited}))?;
+                let current = session.call("pane.current", json!({"caller_pane_id": inherited}))?;
                 Some(
                     current["pane"]["tab_id"]
                         .as_str()
@@ -217,15 +209,20 @@ pub fn dock_command(command: dock_control::Command) -> io::Result<()> {
             Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidInput, error)),
         }
     };
+    session.check()?;
+    start_inner(true)?;
+    session.check()?;
     let (_, ready) = daemon_paths()?;
     let mut stream = UnixStream::connect(ready)?;
     stream.set_read_timeout(Some(START_TIMEOUT))?;
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+    session.check()?;
     serde_json::to_writer(
         &mut stream,
         &DockRequest {
             command,
             caller_tab_id,
+            session: session.key().to_owned(),
         },
     )?;
     stream.write_all(b"\n")?;
@@ -254,7 +251,7 @@ fn handle_command(
     mut stream: UnixStream,
     controller: &mut dock_control::Controller,
 ) -> io::Result<bool> {
-    stream.set_read_timeout(Some(POLL_INTERVAL))?;
+    stream.set_read_timeout(Some(Duration::from_millis(300)))?;
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
     let result = (|| {
         let mut line = String::new();
@@ -269,7 +266,11 @@ fn handle_command(
             ));
         }
         let request: DockRequest = serde_json::from_str(&line)?;
-        controller.command(request.command, request.caller_tab_id.as_deref())?;
+        controller.command(
+            request.command,
+            request.caller_tab_id.as_deref(),
+            &request.session,
+        )?;
         Ok(Some(()))
     })();
     let reply = match result {
@@ -337,11 +338,18 @@ fn run_inner() -> io::Result<()> {
         Err(error) => return Err(error),
     }
     let mut publisher = Publisher::default();
+    let publication = publication_lock()?;
     let mut controller = dock_control::Controller::new(ready_path.with_extension("json"))?;
     let listener = UnixListener::bind(&ready_path)?;
     let _ready_file = SocketFile(ready_path);
     listener.set_nonblocking(true)?;
-    let socket = socket_path()?;
+    let mut sync = ipc::SnapshotSync::new();
+    let mut settings = config::load()?;
+    let mut settings_at = Instant::now();
+    let mut animated = false;
+    let mut animation_at = Instant::now();
+    let mut lost_at: Option<Instant> = None;
+    let mut last_refresh_error: Option<String> = None;
     // A first toggle must arrive before auto-open, or it would close the dock
     // that startup just created. Abandoned clients only defer startup briefly.
     let awaiting_command = std::env::var(COMMAND_START_ENV).as_deref() == Ok("1");
@@ -356,7 +364,10 @@ fn run_inner() -> io::Result<()> {
         for _ in 0..16 {
             match listener.accept() {
                 Ok((stream, _)) => match handle_command(stream, &mut controller) {
-                    Ok(true) => command_deadline = None,
+                    Ok(true) => {
+                        command_deadline = None;
+                        sync.invalidate();
+                    }
                     Ok(false) => {}
                     Err(error) => {
                         command_deadline = None;
@@ -368,48 +379,91 @@ fn run_inner() -> io::Result<()> {
             }
         }
         if command_deadline.is_some_and(|deadline| Instant::now() < deadline) {
-            thread::sleep(POLL_INTERVAL.saturating_sub(started.elapsed()));
+            thread::sleep(ipc::SYNC_CHECK_INTERVAL.saturating_sub(started.elapsed()));
             continue;
         }
         command_deadline = None;
-        let refresh_started = Instant::now();
-        let refreshed = refresh_daemon(&mut publisher, &mut controller);
-        if first {
-            notify_start(
-                &refreshed
-                    .as_ref()
-                    .map(|_| ())
-                    .map_err(|error| io::Error::other(error.to_string())),
-            )?;
-            first = false;
-        }
-        match refreshed {
-            Ok(false) => return Ok(()),
-            Ok(true) => {}
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                ) && !socket.exists() =>
-            {
-                return Ok(())
+        if settings_at.elapsed() >= Duration::from_millis(SPIN_MS) {
+            settings_at = Instant::now();
+            match config::load() {
+                Ok(updated) if updated != settings => {
+                    settings = updated;
+                    sync.invalidate();
+                }
+                Ok(_) => {}
+                Err(error) => eprintln!("sidebar settings: {error}"),
             }
-            Err(error) => eprintln!("sidebar refresh: {error}"),
         }
-        thread::sleep(POLL_INTERVAL.saturating_sub(refresh_started.elapsed()));
+        if animated && animation_at.elapsed() >= Duration::from_millis(SPIN_MS) {
+            sync.invalidate();
+            animation_at = Instant::now();
+        }
+        publication.lock()?;
+        let refreshed = match sync.poll() {
+            Ok(Some(snapshot)) => Some((|| {
+                lost_at = None;
+                animated = settings.enabled
+                    && settings.project_style
+                    && entries(&snapshot.data, "agents")?
+                        .iter()
+                        .any(|agent| matches!(text(agent, "agent_status"), "working" | "blocked"));
+                animation_at = Instant::now();
+                refresh_daemon(&mut publisher, &mut controller, &snapshot, &settings)
+            })()),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        };
+        publication.unlock()?;
+        if let Some(refreshed) = refreshed {
+            if first {
+                notify_start(
+                    &refreshed
+                        .as_ref()
+                        .map(|_| ())
+                        .map_err(|error| io::Error::other(error.to_string())),
+                )?;
+                first = false;
+            }
+            match refreshed {
+                Ok(false) => return Ok(()),
+                Ok(true) => {
+                    lost_at = None;
+                    last_refresh_error = None;
+                }
+                Err(error) => {
+                    sync.invalidate();
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                    ) {
+                        let lost = lost_at.get_or_insert_with(Instant::now);
+                        if lost.elapsed() >= RECOVERY_GRACE {
+                            return Ok(());
+                        }
+                    } else {
+                        lost_at = None;
+                    }
+                    let message = error.to_string();
+                    if last_refresh_error.as_ref() != Some(&message) {
+                        eprintln!("sidebar refresh: {message}");
+                        last_refresh_error = Some(message);
+                    }
+                }
+            }
+        }
+        thread::sleep(ipc::SYNC_CHECK_INTERVAL.saturating_sub(started.elapsed()));
     }
 }
 
 fn refresh_daemon(
     publisher: &mut Publisher,
     controller: &mut dock_control::Controller,
+    snapshot: &ipc::Snapshot,
+    settings: &config::Settings,
 ) -> io::Result<bool> {
-    let settings = config::load()?;
-    let response = ipc::call("session.snapshot", json!({}))?;
-    let snapshot = &response["snapshot"];
     // Both consumers run even if one fails; dock errors must not halt metadata.
-    let published = publisher.refresh(snapshot, &settings);
-    let reconciled = controller.reconcile(snapshot, &settings);
+    let published = publisher.refresh(snapshot, settings);
+    let reconciled = controller.reconcile(snapshot, settings);
     reconciled?;
     published?;
     Ok(settings.enabled)
@@ -438,6 +492,14 @@ fn empty_tokens(keys: &[&str]) -> Tokens {
         .collect()
 }
 
+fn retain_delta(tokens: &mut Tokens, live: Option<&Value>) {
+    tokens.retain(|key, value| {
+        live.and_then(|tokens| tokens.get(key))
+            .unwrap_or(&Value::Null)
+            != &*value
+    });
+}
+
 fn chunk_tokens(tokens: Tokens, limit: usize) -> Vec<Tokens> {
     let mut chunks = Vec::new();
     let mut current = Map::new();
@@ -453,9 +515,9 @@ fn chunk_tokens(tokens: Tokens, limit: usize) -> Vec<Tokens> {
     chunks
 }
 
-fn patch(pane: &str, tokens: Tokens) -> io::Result<()> {
+fn patch(session: &ipc::Session, pane: &str, tokens: Tokens) -> io::Result<()> {
     for chunk in chunk_tokens(tokens, 16) {
-        ipc::call(
+        session.call(
             "pane.report_metadata",
             json!({"pane_id": pane, "source": SOURCE, "tokens": chunk}),
         )?;
@@ -463,9 +525,9 @@ fn patch(pane: &str, tokens: Tokens) -> io::Result<()> {
     Ok(())
 }
 
-fn patch_workspace(workspace: &str, tokens: Tokens) -> io::Result<()> {
+fn patch_workspace(session: &ipc::Session, workspace: &str, tokens: Tokens) -> io::Result<()> {
     for chunk in chunk_tokens(tokens, 16) {
-        ipc::call(
+        session.call(
             "workspace.report_metadata",
             json!({"workspace_id": workspace, "source": SOURCE, "tokens": chunk}),
         )?;
@@ -473,24 +535,43 @@ fn patch_workspace(workspace: &str, tokens: Tokens) -> io::Result<()> {
     Ok(())
 }
 
+fn publication_lock() -> io::Result<fs::File> {
+    let directory = config::state_dir();
+    fs::create_dir_all(&directory)?;
+    let hash = ipc::socket_hash(&socket_path()?);
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(directory.join(format!("p-{hash:016x}.lock")))
+}
+
 pub fn refresh() -> io::Result<()> {
+    // Serialize snapshot acquisition too: an older concurrent --refresh must
+    // not publish metadata or a live-terminal set after a newer daemon refresh.
+    let publication = publication_lock()?;
+    publication.lock()?;
     let settings = config::load()?;
-    let response = ipc::call("session.snapshot", json!({}))?;
-    Publisher::default().refresh(&response["snapshot"], &settings)
+    let snapshot = ipc::session_snapshot()?;
+    Publisher::default().refresh(&snapshot, &settings)
 }
 
 pub fn clear() -> io::Result<()> {
-    let response = ipc::call("session.snapshot", json!({}))?;
-    clear_snapshot(&response["snapshot"])
+    let publication = publication_lock()?;
+    publication.lock()?;
+    clear_snapshot(&ipc::session_snapshot()?)
 }
 
-fn clear_snapshot(snapshot: &Value) -> io::Result<()> {
-    let panes = entries(snapshot, "panes")?;
-    let workspaces = entries(snapshot, "workspaces")?;
+fn clear_snapshot(snapshot: &ipc::Snapshot) -> io::Result<()> {
+    let session = &snapshot.session;
+    session.check()?;
+    let panes = entries(&snapshot.data, "panes")?;
+    let workspaces = entries(&snapshot.data, "workspaces")?;
     let mut failure = None;
     for pane in panes {
         if KEYS.iter().any(|key| pane["tokens"].get(*key).is_some()) {
-            if let Err(error) = patch(text(pane, "pane_id"), empty_tokens(&KEYS)) {
+            if let Err(error) = patch(session, text(pane, "pane_id"), empty_tokens(&KEYS)) {
                 failure = Some(error);
             }
         }
@@ -500,14 +581,16 @@ fn clear_snapshot(snapshot: &Value) -> io::Result<()> {
             .iter()
             .any(|key| workspace["tokens"].get(*key).is_some())
         {
-            if let Err(error) =
-                patch_workspace(text(workspace, "workspace_id"), empty_tokens(&SPACE_KEYS))
-            {
+            if let Err(error) = patch_workspace(
+                session,
+                text(workspace, "workspace_id"),
+                empty_tokens(&SPACE_KEYS),
+            ) {
                 failure = Some(error);
             }
         }
     }
-    if let Err(error) = ipc::call("agent.view.clear", json!({"source": SOURCE})) {
+    if let Err(error) = session.call("agent.view.clear", json!({"source": SOURCE})) {
         failure = Some(error);
     }
     match failure {
@@ -537,7 +620,44 @@ impl Default for Publisher {
 }
 
 impl Publisher {
-    pub fn refresh(&mut self, snapshot: &Value, settings: &config::Settings) -> io::Result<()> {
+    pub fn refresh(
+        &mut self,
+        snapshot: &ipc::Snapshot,
+        settings: &config::Settings,
+    ) -> io::Result<()> {
+        let session = &snapshot.session;
+        let agents = entries(&snapshot.data, "agents")?;
+        let workspaces = entries(&snapshot.data, "workspaces")?;
+        let tabs = entries(&snapshot.data, "tabs")?;
+        let panes = entries(&snapshot.data, "panes")?;
+        if agents
+            .iter()
+            .any(|agent| text(agent, "terminal_id").is_empty())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot agent is missing terminal_id",
+            ));
+        }
+        if self.activity.sync_session(session)? {
+            self.branches.clear();
+            self.branch_at = None;
+            self.grouped = None;
+            self.native_style = false;
+        }
+        let now_ms = now_unix_ms();
+        for agent in agents {
+            if text(agent, "agent_status") == "working" {
+                self.activity
+                    .mark_working(text(agent, "terminal_id"), now_ms);
+            }
+        }
+        let live: HashSet<&str> = agents
+            .iter()
+            .map(|agent| text(agent, "terminal_id"))
+            .collect();
+        self.activity.retain_live(&live);
+        self.activity.save(!settings.enabled)?;
         if !settings.enabled {
             return clear_snapshot(snapshot);
         }
@@ -550,12 +670,7 @@ impl Publisher {
             return Ok(());
         }
         self.native_style = false;
-        let agents = entries(snapshot, "agents")?;
-        let workspaces = entries(snapshot, "workspaces")?;
-        let tabs = entries(snapshot, "tabs")?;
-        let panes = entries(snapshot, "panes")?;
 
-        let now_ms = now_unix_ms();
         let spin_step = (now_ms / SPIN_MS) as usize;
 
         // Branch map at TTL: one socket round trip per repo via native
@@ -584,22 +699,6 @@ impl Publisher {
             }
         }
 
-        // 1. Process agent state transitions and holds
-        for agent in agents {
-            let pane_id = text(agent, "pane_id");
-            let status = text(agent, "agent_status");
-
-            if status == "working" {
-                self.activity.mark_working(pane_id, now_ms);
-            }
-        }
-
-        // Prune vanished panes: holds must never outlive their pane.
-        let live: HashSet<&str> = agents.iter().map(|a| text(a, "pane_id")).collect();
-        self.activity
-            .stamps
-            .retain(|k, _| live.contains(k.as_str()));
-
         // 2. Generate row tokens
         let (wanted, wanted_workspaces) = rows(&RowsInput {
             agents,
@@ -620,34 +719,22 @@ impl Publisher {
             let id = text(pane, "pane_id");
             if !wanted.contains_key(id) && KEYS.iter().any(|key| pane["tokens"].get(*key).is_some())
             {
-                patch(id, empty_tokens(&KEYS))?;
+                patch(session, id, empty_tokens(&KEYS))?;
             }
         }
-        for (pane, tokens) in wanted {
+        for (pane, mut tokens) in wanted {
             let live = panes.iter().find(|p| text(p, "pane_id") == pane);
-            let delta: Tokens = tokens
-                .iter()
-                .filter(|(key, value)| live.and_then(|p| p["tokens"].get(*key)) != Some(*value))
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect();
-            if !delta.is_empty() {
-                patch(&pane, delta)?;
-            }
+            retain_delta(&mut tokens, live.map(|p| &p["tokens"]));
+            patch(session, &pane, tokens)?;
         }
 
         // 4. Patch workspaces (same live-token rule as panes).
-        for (workspace, tokens) in wanted_workspaces {
+        for (workspace, mut tokens) in wanted_workspaces {
             let live = workspaces
                 .iter()
                 .find(|w| text(w, "workspace_id") == workspace);
-            let delta: Tokens = tokens
-                .iter()
-                .filter(|(key, value)| live.and_then(|w| w["tokens"].get(*key)) != Some(*value))
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect();
-            if !delta.is_empty() {
-                patch_workspace(&workspace, delta)?;
-            }
+            retain_delta(&mut tokens, live.map(|w| &w["tokens"]));
+            patch_workspace(session, &workspace, tokens)?;
         }
 
         // 5. Update sort override
@@ -657,7 +744,7 @@ impl Publisher {
             } else {
                 json!([{"field": "state_change_seq", "order": "desc"}, {"field": "tab_order", "order": "asc"}, {"field": "pane_order", "order": "asc"}])
             };
-            ipc::call(
+            session.call(
                 "agent.view.set",
                 json!({"source": SOURCE, "label": if settings.grouped { "active" } else { "recent" }, "sort": sort}),
             )?;
@@ -927,7 +1014,7 @@ pub fn rows(input: &RowsInput) -> (RowTokens, RowTokens) {
         } else if status == "done" {
             "done"
         } else if status == "idle" {
-            match activity.freshness(pane_id, now_ms) {
+            match activity.freshness(text(agent, "terminal_id"), now_ms) {
                 Freshness::Fresh => "idle_fresh",
                 Freshness::Stale => "idle_stale",
                 Freshness::Normal => "idle",
@@ -1069,6 +1156,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn metadata_delta_does_not_repeat_cleared_tokens() {
+        let mut tokens = json!({
+            "missing": null, "same": "label", "obsolete": null, "changed": "new"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        retain_delta(
+            &mut tokens,
+            Some(&json!({"same": "label", "obsolete": "old", "changed": "old"})),
+        );
+        assert_eq!(json!(tokens), json!({"obsolete": null, "changed": "new"}));
+        retain_delta(
+            &mut tokens,
+            Some(&json!({"same": "label", "changed": "new"})),
+        );
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
     fn test_spinner_and_blocked_pulse() {
         let frame0 = icons::spinner(0);
         let frame1 = icons::spinner(1);
@@ -1081,8 +1188,8 @@ mod tests {
     fn test_done_follows_authoritative_status() {
         let activity = ActivityStore::default();
         let agents = vec![
-            json!({"pane_id": "p1", "workspace_id": "w1", "agent": "claude", "agent_status": "idle", "focused": false}),
-            json!({"pane_id": "p2", "workspace_id": "w1", "agent": "claude", "agent_status": "done", "focused": false}),
+            json!({"terminal_id": "t1", "pane_id": "p1", "workspace_id": "w1", "agent": "claude", "agent_status": "idle", "focused": false}),
+            json!({"terminal_id": "t2", "pane_id": "p2", "workspace_id": "w1", "agent": "claude", "agent_status": "done", "focused": false}),
         ];
         let workspaces = vec![json!({"workspace_id": "w1", "label": "demo"})];
         let settings = config::Settings::default();
@@ -1102,5 +1209,80 @@ mod tests {
         assert!(panes["p1"]["title_idle"].is_string());
         assert_eq!(panes["p1"]["title_done"], Value::Null);
         assert!(panes["p2"]["title_done"].is_string());
+    }
+
+    #[test]
+    fn freshness_follows_terminal_when_pane_address_is_reused() {
+        let mut activity = ActivityStore::default();
+        activity.mark_working("terminal-a", 1_000);
+        let mut agents = vec![
+            json!({"terminal_id": "terminal-a", "pane_id": "old", "workspace_id": "workspace", "agent": "claude", "agent_status": "idle"}),
+        ];
+        let workspaces = vec![json!({"workspace_id": "workspace", "label": "demo"})];
+        let settings = config::Settings {
+            show_branch: false,
+            ..config::Settings::default()
+        };
+        let render = |agents: &[Value]| {
+            rows(&RowsInput {
+                agents,
+                workspaces: &workspaces,
+                tabs: &[],
+                panes: &[],
+                settings: &settings,
+                activity: &activity,
+                branches: &BTreeMap::new(),
+                now_ms: 2_000,
+                spin_step: 0,
+            })
+            .0
+        };
+        assert!(render(&agents)["old"]["title_idle_fresh"].is_string());
+        agents[0]["pane_id"] = json!("new");
+        agents.push(json!({"terminal_id": "terminal-b", "pane_id": "old", "workspace_id": "workspace", "agent": "claude", "agent_status": "idle"}));
+        let remapped = render(&agents);
+        assert!(remapped["new"]["title_idle_fresh"].is_string());
+        assert!(remapped["old"]["title_idle"].is_string());
+        assert_eq!(remapped["old"]["title_idle_fresh"], Value::Null);
+    }
+
+    #[test]
+    fn malformed_agent_identity_cannot_prune_valid_history() {
+        let mut publisher = Publisher::default();
+        publisher.activity.mark_working("valid-terminal", 1_000);
+        let socket = std::env::temp_dir().join(format!(
+            "hps-malformed-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let _socket_file = SocketFile(socket.clone());
+        let snapshot = json!({
+            "agents": [
+                {"terminal_id": "valid-terminal", "pane_id": "p1", "agent_status": "working"},
+                {"pane_id": "p2", "agent_status": "working"}
+            ],
+            "workspaces": [],
+            "tabs": [],
+            "panes": []
+        });
+        let snapshot = ipc::Snapshot {
+            session: ipc::Session::at(socket).unwrap(),
+            data: snapshot,
+        };
+        assert_eq!(
+            publisher
+                .refresh(&snapshot, &config::Settings::default())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            publisher.activity.stamps,
+            HashMap::from([("valid-terminal".to_owned(), 1_000)])
+        );
     }
 }

@@ -21,7 +21,7 @@ use ratatui::{
 pub const LABELS: [&str; 10] = [
     "Width",
     "Dock side",
-    "Start open by default",
+    "Auto open",
     "Order",
     "Branches",
     "Task titles",
