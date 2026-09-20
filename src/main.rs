@@ -56,7 +56,6 @@ fn main() -> io::Result<()> {
         Some("--refresh") => native::refresh(),
         Some("--unconfigure") => {
             config::unconfigure()?;
-            native::start()?;
             native::clear()?;
             reload()
         }

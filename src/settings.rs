@@ -114,6 +114,11 @@ pub fn apply(settings: &mut Settings, row: usize, forward: bool) -> io::Result<S
     if row == 9 {
         return crate::icons::install().map(|_| "Installed. Map U+E1A0-U+E1B0 to Herdr Agent Icons Compact in your terminal, then choose Font.".to_owned());
     }
+    let mut candidate = settings.clone();
+    change(&mut candidate, row, forward);
+    if candidate == *settings {
+        return Ok(String::new());
+    }
     *settings = config::update(|current| change(current, row, forward))?;
     crate::reload()
         .map_err(|error| io::Error::other(format!("Saved; Herdr reload failed: {error}")))?;
@@ -268,9 +273,19 @@ pub fn run() -> io::Result<()> {
             dirty = true;
         }
         if let Some(forward) = edit {
-            message =
-                apply(&mut settings, selected, forward).unwrap_or_else(|error| error.to_string());
-            dirty = true;
+            let before = settings.clone();
+            match apply(&mut settings, selected, forward) {
+                Ok(msg) => {
+                    if settings != before || !msg.is_empty() {
+                        message = msg;
+                        dirty = true;
+                    }
+                }
+                Err(error) => {
+                    message = error.to_string();
+                    dirty = true;
+                }
+            }
         }
     }
     Ok(())
@@ -296,5 +311,14 @@ mod tests {
         assert_eq!(LABELS.len(), 10);
         assert_eq!(HELP.len(), 10);
         assert_eq!(values(&settings).len(), 10);
+    }
+
+    #[test]
+    fn apply_unchanged_settings_returns_saved_without_side_effects() {
+        let mut settings = Settings::default();
+        settings.width = 24;
+        let result = apply(&mut settings, 0, false).unwrap();
+        assert_eq!(result, "");
+        assert_eq!(settings.width, 24);
     }
 }

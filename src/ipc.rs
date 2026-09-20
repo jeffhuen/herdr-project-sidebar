@@ -29,8 +29,9 @@ fn request(mut stream: UnixStream, method: &str, params: Value) -> io::Result<Va
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
     let id = format!("herdr-project-sidebar:{method}");
     let request = json!({"id": id, "method": method, "params": params});
-    serde_json::to_writer(&mut stream, &request)?;
-    stream.write_all(b"\n")?;
+    let mut bytes = serde_json::to_vec(&request)?;
+    bytes.push(b'\n');
+    stream.write_all(&bytes)?;
     read_response(stream, &id)
 }
 
@@ -96,6 +97,10 @@ impl Session {
 
     pub fn key(&self) -> &str {
         &self.key
+    }
+
+    pub fn socket(&self) -> &Path {
+        &self.socket
     }
 
     pub fn socket_hash(&self) -> u64 {
@@ -433,37 +438,6 @@ impl SnapshotSync {
         self.retry_at = Some(now + RECONNECT_INTERVAL);
         Err(error)
     }
-}
-
-/// checkout path -> branch across repos, via native worktree.list. One socket
-/// round trip per repo root; callers cache (branches move rarely). Paths are
-/// normalized (no trailing slash) so checkout_path joins match.
-pub fn branch_map(roots: &[String]) -> std::collections::BTreeMap<String, String> {
-    fn norm(s: &str) -> String {
-        s.trim_end_matches('/').to_owned()
-    }
-    let mut map = std::collections::BTreeMap::new();
-    for root in roots {
-        // Daemon rejects trailing-slash cwds; normalize the request.
-        let beans = call(
-            "worktree.list",
-            json!({ "cwd": root.trim_end_matches('/') }),
-        );
-        let Ok(list) = beans else { continue };
-        let empty = Vec::new();
-        for w in list
-            .pointer("/worktrees")
-            .and_then(Value::as_array)
-            .unwrap_or(&empty)
-        {
-            let path = w.get("path").and_then(Value::as_str).unwrap_or("");
-            let branch = w.get("branch").and_then(Value::as_str).unwrap_or("");
-            if !path.is_empty() && !branch.is_empty() {
-                map.insert(norm(path), branch.to_owned());
-            }
-        }
-    }
-    map
 }
 
 #[cfg(test)]

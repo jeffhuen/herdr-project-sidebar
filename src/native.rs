@@ -16,7 +16,8 @@ use crate::activity::{now_unix_ms, ActivityStore, Freshness};
 use crate::{config, dock_control, icons, ipc};
 
 const SOURCE: &str = "plugin:herdr-project-sidebar";
-const SPIN_MS: u64 = 300;
+const SPIN_MS: u64 = 250;
+const SETTINGS_POLL: Duration = Duration::from_millis(300);
 const CONTROL_LIMIT: u64 = 8192;
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const READY_ENV: &str = "HERDR_PROJECT_SIDEBAR_READY";
@@ -95,11 +96,37 @@ impl Drop for SocketFile {
 }
 
 pub fn start() -> io::Result<()> {
+    if !config::load()?.enabled {
+        return Ok(());
+    }
     start_inner(false)
 }
 
 fn start_inner(await_command: bool) -> io::Result<()> {
     let (_, ready) = daemon_paths()?;
+    // Serialize launchers before spawning, not after each has created a daemon.
+    let launch = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(ready.with_extension("start.lock"))?;
+    let deadline = Instant::now() + START_TIMEOUT;
+    loop {
+        match launch.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "sidebar launcher is busy",
+                ));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
     if UnixStream::connect(&ready).is_ok() {
         return Ok(());
     }
@@ -121,7 +148,7 @@ fn start_inner(await_command: bool) -> io::Result<()> {
         .process_group(0)
         .spawn()?;
     let deadline = Instant::now() + START_TIMEOUT;
-    loop {
+    let result = (|| loop {
         match listener.accept() {
             Ok((stream, _)) => {
                 stream.set_read_timeout(Some(Duration::from_secs(3)))?;
@@ -168,7 +195,12 @@ fn start_inner(await_command: bool) -> io::Result<()> {
             ));
         }
         thread::sleep(Duration::from_millis(20));
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
     }
+    result
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -346,8 +378,9 @@ fn run_inner() -> io::Result<()> {
     let mut sync = ipc::SnapshotSync::new();
     let mut settings = config::load()?;
     let mut settings_at = Instant::now();
-    let mut animated = false;
+    let mut animation_session = None;
     let mut animation_at = Instant::now();
+    let mut plugin_check_at = Instant::now();
     let mut lost_at: Option<Instant> = None;
     let mut last_refresh_error: Option<String> = None;
     // A first toggle must arrive before auto-open, or it would close the dock
@@ -383,7 +416,7 @@ fn run_inner() -> io::Result<()> {
             continue;
         }
         command_deadline = None;
-        if settings_at.elapsed() >= Duration::from_millis(SPIN_MS) {
+        if settings_at.elapsed() >= SETTINGS_POLL {
             settings_at = Instant::now();
             match config::load() {
                 Ok(updated) if updated != settings => {
@@ -394,24 +427,54 @@ fn run_inner() -> io::Result<()> {
                 Err(error) => eprintln!("sidebar settings: {error}"),
             }
         }
-        if animated && animation_at.elapsed() >= Duration::from_millis(SPIN_MS) {
-            sync.invalidate();
-            animation_at = Instant::now();
-        }
         publication.lock()?;
         let refreshed = match sync.poll() {
             Ok(Some(snapshot)) => Some((|| {
                 lost_at = None;
-                animated = settings.enabled
-                    && settings.project_style
-                    && entries(&snapshot.data, "agents")?
+                animation_session = None;
+                if plugin_check_at.elapsed() >= Duration::from_secs(5) {
+                    plugin_check_at = Instant::now();
+                    let registry = snapshot.session.call("plugin.list", json!({}))?;
+                    let enabled = registry["plugins"]
+                        .as_array()
+                        .ok_or_else(|| io::Error::other("Herdr omitted plugin registry"))?
                         .iter()
-                        .any(|agent| matches!(text(agent, "agent_status"), "working" | "blocked"));
-                animation_at = Instant::now();
-                refresh_daemon(&mut publisher, &mut controller, &snapshot, &settings)
+                        .any(|plugin| {
+                            plugin["plugin_id"] == "herdr-project-sidebar"
+                                && plugin["enabled"] == true
+                        });
+                    if !enabled {
+                        config::unconfigure()?;
+                        settings.enabled = false;
+                        sync.invalidate();
+                        crate::reload()?;
+                    }
+                }
+                let result = refresh_daemon(&mut publisher, &mut controller, &snapshot, &settings);
+                if result.is_ok() {
+                    animation_session = Some(snapshot.session);
+                    animation_at = Instant::now();
+                }
+                result
             })()),
             Ok(None) => None,
-            Err(error) => Some(Err(error)),
+            Err(error) => {
+                animation_session = None;
+                Some(Err(error))
+            }
+        };
+        let refreshed = if refreshed.is_none()
+            && !sync.is_stale()
+            && animation_at.elapsed() >= Duration::from_millis(SPIN_MS)
+        {
+            animation_at = Instant::now();
+            animation_session.as_ref().map(|session| {
+                publisher
+                    .animate(session, (now_unix_ms() / SPIN_MS) as usize)
+                    .map(|_| true)
+            })
+        } else {
+            refreshed
         };
         publication.unlock()?;
         if let Some(refreshed) = refreshed {
@@ -431,7 +494,12 @@ fn run_inner() -> io::Result<()> {
                     last_refresh_error = None;
                 }
                 Err(error) => {
-                    sync.invalidate();
+                    let message = error.to_string();
+                    if last_refresh_error.as_ref() != Some(&message) {
+                        eprintln!("sidebar refresh: {message}");
+                        last_refresh_error = Some(message);
+                        sync.invalidate();
+                    }
                     if matches!(
                         error.kind(),
                         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
@@ -442,11 +510,6 @@ fn run_inner() -> io::Result<()> {
                         }
                     } else {
                         lost_at = None;
-                    }
-                    let message = error.to_string();
-                    if last_refresh_error.as_ref() != Some(&message) {
-                        eprintln!("sidebar refresh: {message}");
-                        last_refresh_error = Some(message);
                     }
                 }
             }
@@ -558,9 +621,32 @@ pub fn refresh() -> io::Result<()> {
 }
 
 pub fn clear() -> io::Result<()> {
+    // Use the controller only when no daemon owns it; keep daemon -> publication
+    // lock order identical to run_inner so cleanup cannot race a live owner.
+    let (lock_path, ready_path) = daemon_paths()?;
+    let daemon = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    let own_controller = match daemon.try_lock() {
+        Ok(()) => true,
+        Err(std::fs::TryLockError::WouldBlock) => false,
+        Err(std::fs::TryLockError::Error(error)) => return Err(error),
+    };
     let publication = publication_lock()?;
     publication.lock()?;
-    clear_snapshot(&ipc::session_snapshot()?)
+    let snapshot = ipc::session_snapshot()?;
+    let cleared = clear_snapshot(&snapshot);
+    if own_controller {
+        let settings = config::load()?;
+        if !settings.enabled {
+            dock_control::Controller::new(ready_path.with_extension("json"))?
+                .reconcile(&snapshot, &settings)?;
+        }
+    }
+    cleared
 }
 
 fn clear_snapshot(snapshot: &ipc::Snapshot) -> io::Result<()> {
@@ -601,8 +687,7 @@ fn clear_snapshot(snapshot: &ipc::Snapshot) -> io::Result<()> {
 
 pub struct Publisher {
     pub activity: ActivityStore,
-    branches: BTreeMap<String, String>,
-    branch_at: Option<Instant>,
+    animated: BTreeMap<String, (&'static str, String)>,
     grouped: Option<bool>,
     native_style: bool,
 }
@@ -611,8 +696,7 @@ impl Default for Publisher {
     fn default() -> Self {
         Self {
             activity: ActivityStore::new(config::state_dir()),
-            branches: BTreeMap::new(),
-            branch_at: None,
+            animated: BTreeMap::new(),
             grouped: None,
             native_style: false,
         }
@@ -620,12 +704,37 @@ impl Default for Publisher {
 }
 
 impl Publisher {
+    fn animate(&mut self, session: &ipc::Session, step: usize) -> io::Result<()> {
+        for (pane, (key, title)) in &mut self.animated {
+            let (previous, text) = title
+                .split_once(' ')
+                .ok_or_else(|| io::Error::other("invalid animated title"))?;
+            let mark = if *key == "title_working" {
+                icons::spinner(step)
+            } else {
+                icons::blocked_mark(step)
+            };
+            if mark == previous {
+                continue;
+            }
+            let next = format!("{mark} {text}");
+            patch(
+                session,
+                pane,
+                Map::from_iter([((*key).to_owned(), json!(next))]),
+            )?;
+            *title = next;
+        }
+        Ok(())
+    }
+
     pub fn refresh(
         &mut self,
         snapshot: &ipc::Snapshot,
         settings: &config::Settings,
     ) -> io::Result<()> {
         let session = &snapshot.session;
+        self.animated.clear();
         let agents = entries(&snapshot.data, "agents")?;
         let workspaces = entries(&snapshot.data, "workspaces")?;
         let tabs = entries(&snapshot.data, "tabs")?;
@@ -640,8 +749,6 @@ impl Publisher {
             ));
         }
         if self.activity.sync_session(session)? {
-            self.branches.clear();
-            self.branch_at = None;
             self.grouped = None;
             self.native_style = false;
         }
@@ -673,32 +780,6 @@ impl Publisher {
 
         let spin_step = (now_ms / SPIN_MS) as usize;
 
-        // Branch map at TTL: one socket round trip per repo via native
-        // worktree.list (5s); the per-row git probe is fallback only.
-        {
-            let mut roots: Vec<String> = workspaces
-                .iter()
-                .filter_map(|w| {
-                    let r = text(&w["worktree"], "repo_root");
-                    if r.is_empty() {
-                        None
-                    } else {
-                        Some(r.to_owned())
-                    }
-                })
-                .collect();
-            roots.sort();
-            roots.dedup();
-            if self
-                .branch_at
-                .map(|t| t.elapsed() >= Duration::from_secs(5))
-                .unwrap_or(true)
-            {
-                self.branches = crate::ipc::branch_map(&roots);
-                self.branch_at = Some(Instant::now());
-            }
-        }
-
         // 2. Generate row tokens
         let (wanted, wanted_workspaces) = rows(&RowsInput {
             agents,
@@ -707,7 +788,6 @@ impl Publisher {
             panes,
             settings,
             activity: &self.activity,
-            branches: &self.branches,
             now_ms,
             spin_step,
         });
@@ -723,6 +803,11 @@ impl Publisher {
             }
         }
         for (pane, mut tokens) in wanted {
+            for key in ["title_working", "title_blocked"] {
+                if let Some(title) = tokens[key].as_str() {
+                    self.animated.insert(pane.clone(), (key, title.to_owned()));
+                }
+            }
             let live = panes.iter().find(|p| text(p, "pane_id") == pane);
             retain_delta(&mut tokens, live.map(|p| &p["tokens"]));
             patch(session, &pane, tokens)?;
@@ -772,7 +857,6 @@ pub struct RowsInput<'a> {
     pub panes: &'a [Value],
     pub settings: &'a config::Settings,
     pub activity: &'a ActivityStore,
-    pub branches: &'a BTreeMap<String, String>,
     pub now_ms: u64,
     pub spin_step: usize,
 }
@@ -785,7 +869,6 @@ pub fn rows(input: &RowsInput) -> (RowTokens, RowTokens) {
         panes,
         settings,
         activity,
-        branches,
         now_ms,
         spin_step,
     } = *input;
@@ -827,17 +910,11 @@ pub fn rows(input: &RowsInput) -> (RowTokens, RowTokens) {
             let branch = if !settings.show_branch {
                 None
             } else {
-                branches
-                    .get(checkout.trim_end_matches('/'))
-                    .filter(|b| !b.is_empty())
-                    .map(|b| b.to_owned())
-                    .or_else(|| {
-                        git_branch(Path::new(if checkout.is_empty() {
-                            cwd.get(id.as_str()).copied().unwrap_or("")
-                        } else {
-                            checkout
-                        }))
-                    })
+                git_branch(Path::new(if checkout.is_empty() {
+                    cwd.get(id.as_str()).copied().unwrap_or("")
+                } else {
+                    checkout
+                }))
             };
             (
                 id.clone(),
@@ -1126,7 +1203,7 @@ fn agent_title(agent: &Value, show_title: bool) -> &str {
     }
 }
 
-fn git_branch(start: &Path) -> Option<String> {
+pub fn git_branch(start: &Path) -> Option<String> {
     if !start.is_absolute() {
         return None;
     }
@@ -1176,12 +1253,88 @@ mod tests {
     }
 
     #[test]
-    fn test_spinner_and_blocked_pulse() {
-        let frame0 = icons::spinner(0);
-        let frame1 = icons::spinner(1);
-        assert_ne!(frame0, frame1);
-        assert_eq!(icons::blocked_mark(0), "?");
-        assert_eq!(icons::blocked_mark(5), "·");
+    fn animation_patches_only_changed_titles_without_fetching_snapshots() {
+        let socket =
+            std::env::temp_dir().join(format!("hps-animation-{}.sock", std::process::id()));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let _socket_file = SocketFile(socket.clone());
+        listener.set_nonblocking(true).unwrap();
+        let session = ipc::Session::at(socket).unwrap();
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline && requests.len() < 3 {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut line = String::new();
+                BufReader::new(&mut stream).read_line(&mut line).unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                writeln!(stream, "{}", json!({"id":request["id"],"result":{}})).unwrap();
+                requests.push(request);
+            }
+            requests
+        });
+        let mut publisher = Publisher::default();
+        publisher.animated.insert(
+            "working".into(),
+            ("title_working", format!("{} build", icons::spinner(0))),
+        );
+        publisher
+            .animated
+            .insert("blocked".into(), ("title_blocked", "? approval".into()));
+        publisher.animate(&session, 0).unwrap();
+        publisher.animate(&session, 1).unwrap();
+        publisher.animate(&session, 3).unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests
+            .iter()
+            .all(|request| request["method"] == "pane.report_metadata"));
+        assert!(requests.iter().all(|request| request["params"]["tokens"]
+            .as_object()
+            .unwrap()
+            .len()
+            == 1));
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["params"]["pane_id"] == "blocked")
+                .count(),
+            1
+        );
+        assert_eq!(publisher.animated["blocked"].1, "· approval");
+        assert_eq!(
+            publisher.animated["working"].1,
+            format!("{} build", icons::spinner(3))
+        );
+    }
+
+    #[test]
+    fn branch_lookup_handles_relative_gitdirs_and_detached_heads() {
+        let root = std::env::temp_dir().join(format!("hps-head-{}", std::process::id()));
+        fs::create_dir_all(root.join("checkout/nested")).unwrap();
+        fs::create_dir_all(root.join("git")).unwrap();
+        fs::write(root.join("checkout/.git"), "gitdir: ../git\n").unwrap();
+        fs::write(root.join("git/HEAD"), "ref: refs/heads/topic/branch\n").unwrap();
+        assert_eq!(
+            git_branch(&root.join("checkout/nested")).as_deref(),
+            Some("topic/branch")
+        );
+        fs::write(root.join("git/HEAD"), "abcdef0123456789\n").unwrap();
+        assert_eq!(
+            git_branch(&root.join("checkout/nested")).as_deref(),
+            Some("abcdef0")
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1201,7 +1354,6 @@ mod tests {
             panes: &[],
             settings: &settings,
             activity: &activity,
-            branches: &BTreeMap::new(),
             now_ms: 1000,
             spin_step: 0,
         });
@@ -1231,7 +1383,6 @@ mod tests {
                 panes: &[],
                 settings: &settings,
                 activity: &activity,
-                branches: &BTreeMap::new(),
                 now_ms: 2_000,
                 spin_step: 0,
             })

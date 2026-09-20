@@ -74,6 +74,30 @@ Herdr 0.9.1 does not expose plugin actions in its mouse menus, so settings must
 be opened by shortcut or CLI. Once open, every control supports the mouse.
 Herdr's native sidebar stays on the left. The terminal dock supports either side.
 
+### Copy references (Unreleased)
+
+In the terminal dock, press `m` on a browsed row or use `Ctrl+right-click` to
+forward the click through Herdr. Plain right-click also works when forwarded.
+Use arrows or `j/k`, then `Enter`, or click an action. `Esc` or an outside click
+closes the menu without activating a row.
+
+- **Project:** name, available repository path/key, and all member workspace IDs.
+- **Worktree:** checkout path, branch name, and owning workspace ID.
+- **Agent:** working directory, pane/terminal/tab/workspace IDs, and the agent
+  session reference when supplied by Herdr. Pi/OMP session files are copied as
+  paths, not presented as session UUIDs.
+- **Copy reference:** a JSON block with available fields, host, and Herdr socket.
+
+A terminal ID follows a moved agent; its workspace-qualified pane ID can change.
+An open menu follows that terminal and reads its current IDs before copying.
+Unknown repository paths are labelled as directories; ambiguous project paths
+are listed together rather than choosing one child.
+
+Clipboard writes travel through Herdr to the viewing client, not a clipboard
+program on the server. Over SSH, the outer terminal must allow OSC 52 writes.
+“Clipboard request sent” confirms the request, not an OS clipboard acknowledgement.
+Menus do not change the normal snapshot cadence or add metadata writes.
+
 ## Settings
 
 Settings persist in `config.toml` under the directory printed by:
@@ -168,10 +192,26 @@ ownership record, and dock pin/fold state live under `HERDR_PLUGIN_STATE_DIR`.
 The native publisher and terminal dock each subscribe to Herdr's semantic topology
 and agent-status events. Notifications trigger full `session.snapshot` reads,
 coalesced on a 300ms floor, with a five-second recovery read for missed changes.
-Native working/blocked animation still refreshes on the 300ms floor. The dock
-animates independently, skips unchanged frames, and renders a window around the
-browsing cursor. Neither process subscribes to `pane.updated`; focus events do
-not spawn launchers, and metadata writes contain only changed tokens.
+Animations are capped at four frames per second. Native animation patches cached
+title marks without reading a snapshot or running dock reconciliation. Title text
+changes without a subscribed event can take about five seconds to appear.
+The dock animates only working rows in its rendered window, skips unchanged frames,
+and reuses its signature buffers. Idle input polling waits up to 300ms; menus and
+pending synchronization use 50ms. Keyboard input wakes the poll immediately.
+Neither process subscribes to `pane.updated`; focus events do not spawn launchers,
+and metadata writes contain only changed tokens.
+
+With the dock open, there are two persistent plugin processes per socket: the
+publisher/controller and the dock. Herdr still schedules a short-lived tab-bar
+formatter every six seconds. It reads the supplied cwd and local Git HEAD files,
+without running Git or enumerating workspaces and worktrees. Branch labels use the
+nearest checkout, including a submodule's own branch or detached HEAD.
+
+Concurrent launchers serialize before spawning a publisher. Disabled `--start`
+calls do nothing, and failed startup kills and reaps the child. A periodic registry
+check detects native plugin disable or removal, restores owned configuration, and
+closes the dock before exiting. `--unconfigure` can also close an orphaned dock
+without starting a replacement publisher.
 
 Agent selection and activity history use `terminal_id`; native commands use the
 current pane and workspace IDs. A moved agent keeps its selection and history;
@@ -194,6 +234,17 @@ The public plugin API has no boot/revision snapshot stream or event replay
 cursor, unlike Herdr's native client protocol. Herdr 0.9.1 also checks each
 per-agent status subscription at 100ms intervals on the server. Fewer full
 snapshots do not imply an equivalent reduction in server-side work.
+
+The optimized build used the earlier two-frames-per-second animation cap in the
+following measurements.
+
+In an isolated Herdr 0.9.1 before/after check with six 120×40 PTY clients and one
+working agent over 12 seconds, combined publisher/dock snapshot calls fell from
+37 to 4. Aggregate client terminal output fell from 64,074 to 27,026 bytes (58%).
+An idle run produced no client terminal output and no publisher or dock writes.
+A separate run kept all six clients connected with 12 working agents. These are
+local checks, not Mosh network measurements or verification of the reported remote
+freeze.
 
 Placement uses native splits and absolute ratios. Moving into or out of a zoomed
 tab waits until you unzoom it. Existing multi-row layouts are preserved; the dock

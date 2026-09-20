@@ -9,7 +9,7 @@ pub fn spinner(step: usize) -> &'static str {
 }
 
 pub fn blocked_mark(step: usize) -> &'static str {
-    if (step / 5) % 2 == 1 {
+    if (step / 3) % 2 == 1 {
         "·"
     } else {
         "?"

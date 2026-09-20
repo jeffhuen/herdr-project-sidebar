@@ -1,13 +1,14 @@
 //! herdr-project-sidebar: Collapsible project -> worktree -> agent tree.
 //! Change-driven socket snapshots feed the custom tree. Failed refreshes keep
 //! the last view but disable native actions until synchronization recovers.
-//! Rendering remains signature-skipped and windowed, with 150ms animation.
+//! Rendering is signature-skipped and windowed, with animation capped at 4fps.
 //!
 //! Theming: colors come from Herdr's own `config.toml` (`theme.custom` +
 //! `ui.sidebar.agents` row rules) with built-in defaults when absent. Nothing
 //! is written back; light/dark follows whatever theme is configured.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::fmt::Write as _;
 use std::io;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -27,8 +28,10 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
 use serde::Deserialize;
 
+mod menu;
+
 const SPINNER: [&str; 8] = ["⣷", "⣯", "⣟", "⡿", "⢿", "⣻", "⣽", "⣾"];
-const TICK: Duration = Duration::from_millis(150);
+const TICK: Duration = Duration::from_millis(250);
 const IDLE_POLL: Duration = Duration::from_millis(300);
 const NO_SELECTION: usize = usize::MAX;
 const BRANCH_TTL: Duration = Duration::from_secs(5);
@@ -93,6 +96,8 @@ struct Agent {
     pane_id: String,
     tab_id: String,
     workspace_id: String,
+    cwd: String,
+    session_ref: Option<AgentSession>,
     seq: u64,
     focused: bool,
 }
@@ -102,6 +107,8 @@ struct Worktree {
     key: String,
     name: String,
     branch: String,
+    path: String,
+    repo_root: String,
     collapsed: bool,
     depth: usize,
     /// Owning workspace: the focus target for this row.
@@ -121,6 +128,8 @@ struct Project {
     focused: bool,
     /// Member workspace ids (one for Solo). Header focus targets the first.
     workspaces: Vec<String>,
+    /// All member pane directories, including non-agent shells but excluding the dock.
+    directories: Vec<String>,
     worktrees: Vec<Worktree>,
 }
 
@@ -183,10 +192,13 @@ fn stub() -> Vec<Project> {
             pinned: false,
             focused: false,
             workspaces: vec![],
+            directories: vec!["/projects/muse-bridge".into()],
             worktrees: vec![Worktree {
                 key: "stub-a/main".into(),
                 name: "main".into(),
                 branch: "main".into(),
+                path: "/projects/muse-bridge".into(),
+                repo_root: String::new(),
                 collapsed: false,
                 depth: 0,
                 workspace_id: "".into(),
@@ -200,6 +212,8 @@ fn stub() -> Vec<Project> {
                         pane_id: "w1:p1".into(),
                         workspace_id: "".into(),
                         tab_id: "".into(),
+                        cwd: "/projects/muse-bridge".into(),
+                        session_ref: None,
                         seq: 0,
                         focused: false,
                     },
@@ -212,6 +226,8 @@ fn stub() -> Vec<Project> {
                         pane_id: "w1:p2".into(),
                         workspace_id: "".into(),
                         tab_id: "".into(),
+                        cwd: "/projects/muse-bridge".into(),
+                        session_ref: None,
                         seq: 0,
                         focused: false,
                     },
@@ -224,6 +240,8 @@ fn stub() -> Vec<Project> {
                         pane_id: "w1:p3".into(),
                         workspace_id: "".into(),
                         tab_id: "".into(),
+                        cwd: "/projects/muse-bridge".into(),
+                        session_ref: None,
                         seq: 0,
                         focused: false,
                     },
@@ -240,10 +258,13 @@ fn stub() -> Vec<Project> {
             pinned: false,
             focused: false,
             workspaces: vec![],
+            directories: vec!["/projects/sold-by-robots".into()],
             worktrees: vec![Worktree {
                 key: "stub-b/feature".into(),
                 name: "sbr-9u4v.35".into(),
                 branch: "feature/mc-13200".into(),
+                path: "/projects/sold-by-robots".into(),
+                repo_root: String::new(),
                 collapsed: false,
                 depth: 0,
                 workspace_id: "".into(),
@@ -256,6 +277,8 @@ fn stub() -> Vec<Project> {
                     pane_id: "w2:p1".into(),
                     workspace_id: "".into(),
                     tab_id: "".into(),
+                    cwd: "/projects/sold-by-robots".into(),
+                    session_ref: None,
                     seq: 0,
                     focused: false,
                 }],
@@ -265,6 +288,14 @@ fn stub() -> Vec<Project> {
 }
 
 // ---------- Snapshot tree ----------
+
+#[derive(Clone, Deserialize, PartialEq)]
+struct AgentSession {
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    value: String,
+}
 
 #[derive(Deserialize)]
 struct AgentEntry {
@@ -287,6 +318,8 @@ struct AgentEntry {
     cwd: String,
     #[serde(default)]
     foreground_cwd: Option<String>,
+    #[serde(default)]
+    agent_session: Option<AgentSession>,
     #[serde(default)]
     focused: bool,
     #[serde(default)]
@@ -398,42 +431,6 @@ fn nest_level(probes: &BTreeMap<&str, &str>, main: Option<&str>, member: &str) -
     1 + depth
 }
 
-/// Branch straight from `.git/HEAD`: always current, one file read. No dirty
-/// marker (that needs git); `.git` may be a file (`gitdir:` pointer) in a
-/// worktree or submodule.
-fn git_branch(start: &str) -> Option<String> {
-    let mut dir = std::path::PathBuf::from(start);
-    if !dir.is_absolute() {
-        return None;
-    }
-    loop {
-        let candidate = dir.join(".git");
-        let gitdir = if candidate.is_dir() {
-            candidate
-        } else if candidate.is_file() {
-            let text = std::fs::read_to_string(&candidate).ok()?;
-            let pointer = text
-                .lines()
-                .find_map(|l| l.strip_prefix("gitdir:"))
-                .map(str::trim)?;
-            dir.join(pointer)
-        } else {
-            let p = dir.parent()?;
-            dir = p.to_path_buf();
-            continue;
-        };
-        let head = std::fs::read_to_string(gitdir.join("HEAD")).ok()?;
-        let head = head.trim();
-        if let Some(r) = head.strip_prefix("ref: refs/heads/") {
-            return Some(r.to_string());
-        }
-        if head.len() >= 7 && head.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Some(head[..7].to_string());
-        }
-        return None;
-    }
-}
-
 /// True when `start` is a linked git worktree: `.git` is a file whose
 /// `gitdir:` pointer runs through a `/worktrees/` dir. Submodules also use
 /// a `.git` file but point at `/modules/`, so they stay plain checkouts.
@@ -468,7 +465,7 @@ struct Memory {
     font_choice: String,
     dirty_state: bool,
     last_state_save: Option<std::time::Instant>,
-    /// checkout path -> branch, via native worktree.list (5s TTL).
+    /// Checkout path -> branch from Git HEAD reads, cached for five seconds.
     branches: BTreeMap<String, String>,
     linked_checkouts: HashSet<String>,
     branch_at: Option<std::time::Instant>,
@@ -494,13 +491,7 @@ fn refresh_branches(snap: &serde_json::Value, mem: &mut Memory) {
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     let agents = snap["agents"].as_array().map(Vec::as_slice).unwrap_or(&[]);
-    let roots: BTreeSet<&str> = workspaces
-        .iter()
-        .filter_map(|w| w.pointer("/worktree/repo_root").and_then(|v| v.as_str()))
-        .filter(|root| !root.is_empty())
-        .collect();
-    mem.branches =
-        crate::ipc::branch_map(&roots.into_iter().map(str::to_owned).collect::<Vec<_>>());
+    mem.branches.clear();
     mem.linked_checkouts.clear();
     let probes: BTreeSet<&str> = workspaces
         .iter()
@@ -519,7 +510,7 @@ fn refresh_branches(snap: &serde_json::Value, mem: &mut Memory) {
     for probe in probes {
         let key = probe.trim_end_matches('/');
         if !mem.branches.contains_key(key) {
-            if let Some(branch) = git_branch(probe) {
+            if let Some(branch) = crate::native::git_branch(std::path::Path::new(probe)) {
                 mem.branches.insert(key.to_owned(), branch);
             }
         }
@@ -673,6 +664,24 @@ fn snapshot(
         .iter()
         .map(|w| (w.workspace_id.as_str(), w))
         .collect();
+    let mut workspace_directories: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for pane in snap["panes"].as_array().into_iter().flatten() {
+        if pane["tokens"]["hps_dock"].as_str() == Some("projects") {
+            continue;
+        }
+        let Some(workspace) = pane["workspace_id"].as_str() else {
+            continue;
+        };
+        let directory = pane["foreground_cwd"]
+            .as_str()
+            .filter(|path| !path.is_empty())
+            .or_else(|| pane["cwd"].as_str())
+            .unwrap_or("");
+        workspace_directories
+            .entry(workspace)
+            .or_default()
+            .insert(directory);
+    }
     fn repo_of(ws_by_id: &BTreeMap<&str, &WorkspaceEntry>, ws_id: &str) -> Option<String> {
         ws_by_id
             .get(ws_id)
@@ -852,6 +861,13 @@ fn snapshot(
                         pane_id: e.pane_id.clone(),
                         tab_id: e.tab_id.clone(),
                         workspace_id: e.workspace_id.clone(),
+                        cwd: e
+                            .foreground_cwd
+                            .as_ref()
+                            .filter(|cwd| !cwd.is_empty())
+                            .unwrap_or(&e.cwd)
+                            .clone(),
+                        session_ref: e.agent_session.clone(),
                         seq: e.state_change_seq,
                         focused: e.focused,
                     }
@@ -888,6 +904,12 @@ fn snapshot(
                 key: wt_key.clone(),
                 name: label,
                 branch,
+                path: wt
+                    .map(|wt| wt.checkout_path.clone())
+                    .filter(|path| !path.is_empty())
+                    .or_else(|| entries.first().map(|entry| entry.cwd.clone()))
+                    .unwrap_or_default(),
+                repo_root: wt.map(|wt| wt.repo_root.clone()).unwrap_or_default(),
                 collapsed: mem.collapsed_worktrees.contains(&wt_key),
                 depth,
                 workspace_id: match key {
@@ -972,6 +994,14 @@ fn snapshot(
             pinned,
             focused,
             workspaces: member_ids.iter().map(|m| m.to_string()).collect(),
+            directories: member_ids
+                .iter()
+                .filter_map(|id| workspace_directories.get(*id))
+                .flat_map(|paths| paths.iter().copied())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
             worktrees,
         });
     }
@@ -1701,6 +1731,7 @@ pub fn run() -> io::Result<()> {
     let mut font = use_font(&mem.font_choice, font_detected);
     let mut font_notice = font_notice_due(&mem.font_choice, font_detected);
     let mut font_dialog = false;
+    let mut copy_menu = menu::Menus::default();
     let mut visual_rows: Vec<Option<usize>> = Vec::new();
     let mut settings_dialog = false;
     let mut settings_row = 0usize;
@@ -1726,6 +1757,7 @@ pub fn run() -> io::Result<()> {
     let mut tick = 0usize;
     let mut hover: Option<usize> = None;
     let mut last_drawn = String::new();
+    let mut sig = String::new();
     let mut query = String::new();
     let mut filtering = false;
     let mut compact = false;
@@ -1798,6 +1830,7 @@ pub fn run() -> io::Result<()> {
         match refresh {
             Ok(Some((fresh_session, fresh))) => {
                 if session.as_ref().map(crate::ipc::Session::key) != Some(fresh_session.key()) {
+                    copy_menu.close();
                     selected = NO_SELECTION;
                     pressed = None;
                     pending_activation = None;
@@ -1810,12 +1843,17 @@ pub fn run() -> io::Result<()> {
                     .map(|(kind, id)| (kind, id.to_owned()));
                 projects = fresh;
                 session = Some(fresh_session);
+                copy_menu.refresh(&projects);
                 let current_rows = visible(&projects, &query, compact, view);
                 selected = restore_selection(
                     &projects,
                     &current_rows,
                     key.as_ref().map(|(kind, id)| (*kind, id.as_str())),
-                    browsing || filtering || settings_dialog || confirm_close.is_some(),
+                    browsing
+                        || filtering
+                        || settings_dialog
+                        || confirm_close.is_some()
+                        || copy_menu.is_open(),
                 );
                 if selected == NO_SELECTION {
                     confirm_close = None;
@@ -1835,9 +1873,15 @@ pub fn run() -> io::Result<()> {
                 pressed = None;
                 pending_activation = None;
                 confirm_close = None;
+                copy_menu.close();
                 sync.invalidate();
             }
         }
+        copy_menu.poll(
+            &projects,
+            session.as_ref(),
+            sync_error.is_none() && !sync.is_stale(),
+        );
         let activity_error = mem
             .activity
             .save(false)
@@ -1871,7 +1915,9 @@ pub fn run() -> io::Result<()> {
             offset = ensure_visible(selected, offset, height);
         }
         offset = offset.min(rows.len().saturating_sub(height));
-        let working = rows.iter().any(|r| match *r {
+        let (window, slid) = window_for_selected(&rows, offset, height, selected);
+        offset = slid;
+        let working = window.iter().flatten().any(|&idx| match rows[idx] {
             Row::Agent(pi, wi, ai) => {
                 let (g, anim) = state_glyph(projects[pi].worktrees[wi].agents[ai].state, 0, font);
                 let _ = g;
@@ -1879,31 +1925,42 @@ pub fn run() -> io::Result<()> {
             }
             _ => false,
         });
+        // Input must not starve animation or create a zero-timeout busy loop.
+        if working && last_tick.elapsed() >= TICK {
+            tick = tick.wrapping_add(1);
+            last_tick = std::time::Instant::now();
+        }
         let step = if working { tick % SPINNER.len() } else { 0 };
-        let mut sig = signature(&SigInput {
-            projects: &projects,
-            rows: &rows,
-            selected,
-            offset,
-            height,
-            hover,
-            step,
-            query: &query,
-            compact,
-            view,
-            status: &status_line,
-            filtering,
-            theme: &theme,
-            font_dialog,
-            font,
-            settings_dialog,
-            settings_row,
-            settings_obj: &settings_obj,
-        });
-        sig.push_str(&format!(
-            "{sync_error:?}:{activity_error:?}:{}",
-            sync.is_stale()
-        ));
+        signature(
+            &SigInput {
+                projects: &projects,
+                rows: &rows,
+                selected,
+                offset,
+                height,
+                hover,
+                step,
+                query: &query,
+                compact,
+                view,
+                status: &status_line,
+                filtering,
+                theme: &theme,
+                font_dialog,
+                font,
+                settings_dialog,
+                settings_row,
+                settings_obj: &settings_obj,
+            },
+            &mut sig,
+        );
+        write!(
+            sig,
+            "{sync_error:?}:{activity_error:?}:{}:{}",
+            sync.is_stale(),
+            copy_menu.revision
+        )
+        .unwrap();
         if sig != last_drawn {
             let (agents, working_n, blocked, unread) = counts(&projects);
             // First visible agent row per tab, in display order: drives the
@@ -1920,8 +1977,7 @@ pub fn run() -> io::Result<()> {
                     }
                 }
             }
-            let (vis, slid) = window_for_selected(&rows, offset, height, selected);
-            offset = slid;
+            let vis = window;
             let mut lines = Vec::with_capacity(vis.len());
             for entry in &vis {
                 let Some(idx) = entry else {
@@ -2250,8 +2306,9 @@ pub fn run() -> io::Result<()> {
                         rect,
                     );
                 }
+                copy_menu.draw(f, &theme, sync_error.is_none() && !sync.is_stale());
             })?;
-            last_drawn = sig;
+            std::mem::swap(&mut last_drawn, &mut sig);
         }
 
         // Keep the animation deadline independent of event synchronization.
@@ -2260,15 +2317,42 @@ pub fn run() -> io::Result<()> {
         } else {
             IDLE_POLL
         }
-        .min(crate::ipc::SYNC_CHECK_INTERVAL);
+        .min(if sync.is_stale() || copy_menu.is_open() {
+            crate::ipc::SYNC_CHECK_INTERVAL
+        } else {
+            IDLE_POLL
+        });
         if !event::poll(wait)? {
-            if working && last_tick.elapsed() >= TICK {
-                tick = tick.wrapping_add(1);
-                last_tick = std::time::Instant::now();
+            continue;
+        }
+        let input = event::read()?;
+        if matches!(input, Event::Resize(..)) {
+            last_drawn.clear();
+        }
+        if let Event::Mouse(mouse) = input {
+            if mouse.kind == MouseEventKind::Down(MouseButton::Right)
+                && copy_menu.covers(mouse.column, mouse.row)
+            {
+                copy_menu.close();
+                continue;
+            }
+        }
+        if matches!(input, Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Right))
+        {
+            copy_menu.close();
+        } else if copy_menu.is_open() {
+            if let Some(message) = copy_menu.input(
+                &input,
+                &projects,
+                session.as_ref(),
+                sync_error.is_none() && !sync.is_stale(),
+                term.backend_mut(),
+            ) {
+                status_line = message;
             }
             continue;
         }
-        match event::read()? {
+        match input {
             Event::Key(key) if key.kind != crossterm::event::KeyEventKind::Release => {
                 pressed = None;
                 if !matches!(key.code, KeyCode::Enter | KeyCode::Char('o'))
@@ -2343,6 +2427,7 @@ pub fn run() -> io::Result<()> {
                                 "Nerd Font detected".into()
                             };
                             font_dialog = false;
+                            sync.invalidate();
                         }
                         KeyCode::Char('2') => {
                             mem.font_choice = "text".into();
@@ -2352,6 +2437,7 @@ pub fn run() -> io::Result<()> {
                             status_line = "ASCII icons, won't ask again".into();
                             mem.dirty_state = true;
                             save_state(&mut mem, true);
+                            sync.invalidate();
                         }
                         KeyCode::Char('3') => {
                             mem.font_choice = "font".into();
@@ -2361,12 +2447,11 @@ pub fn run() -> io::Result<()> {
                             status_line = "Nerd Font assumed".into();
                             mem.dirty_state = true;
                             save_state(&mut mem, true);
+                            sync.invalidate();
                         }
                         KeyCode::Esc => font_dialog = false,
                         _ => {}
                     }
-                    // Rescan or switch: repaint from the new set immediately.
-                    sync.invalidate();
                     continue;
                 }
                 if matches!(key.code, KeyCode::Enter | KeyCode::Char('o' | 'D' | 'N'))
@@ -2380,6 +2465,13 @@ pub fn run() -> io::Result<()> {
                 }
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('m') => {
+                        let y = visual_rows
+                            .iter()
+                            .position(|row| *row == Some(selected))
+                            .unwrap_or(0);
+                        copy_menu.open(&projects, &rows, selected, (0, y as u16));
+                    }
                     KeyCode::Enter | KeyCode::Char('o') => {
                         pending_activation = PendingActivation::new(
                             &projects,
@@ -2425,14 +2517,20 @@ pub fn run() -> io::Result<()> {
                         settings_obj = crate::config::load().unwrap_or_default();
                     }
                     KeyCode::Char('[') | KeyCode::Char('-') => {
-                        settings_obj.width = settings_obj.width.saturating_sub(2).max(24);
-                        let _ = crate::config::update(|s| s.width = settings_obj.width);
-                        status_line = format!("dock width: {}", settings_obj.width);
+                        let new_width = settings_obj.width.saturating_sub(2).max(24);
+                        if new_width != settings_obj.width {
+                            settings_obj.width = new_width;
+                            let _ = crate::config::update(|s| s.width = settings_obj.width);
+                            status_line = format!("dock width: {}", settings_obj.width);
+                        }
                     }
                     KeyCode::Char(']') | KeyCode::Char('+') | KeyCode::Char('=') => {
-                        settings_obj.width = settings_obj.width.saturating_add(2).min(80);
-                        let _ = crate::config::update(|s| s.width = settings_obj.width);
-                        status_line = format!("dock width: {}", settings_obj.width);
+                        let new_width = settings_obj.width.saturating_add(2).min(80);
+                        if new_width != settings_obj.width {
+                            settings_obj.width = new_width;
+                            let _ = crate::config::update(|s| s.width = settings_obj.width);
+                            status_line = format!("dock width: {}", settings_obj.width);
+                        }
                     }
                     KeyCode::Char('J') => {
                         // Next attention row after the cursor, wrapping: repeated
@@ -2575,6 +2673,16 @@ pub fn run() -> io::Result<()> {
                 }
             }
             Event::Mouse(m) => match m.kind {
+                MouseEventKind::Down(MouseButton::Right) if !settings_dialog && !font_dialog => {
+                    pressed = None;
+                    pending_activation = None;
+                    confirm_close = None;
+                    hover = None;
+                    status_line.clear();
+                    if let Some(index) = visual_hit(&visual_rows, m.row) {
+                        copy_menu.open(&projects, &rows, index, (m.column, m.row));
+                    }
+                }
                 MouseEventKind::Down(MouseButton::Left) => {
                     pressed = None;
                     pending_activation = None;
@@ -2713,6 +2821,9 @@ fn fold_at(projects: &mut [Project], mem: &mut Memory, rows: &[Row], idx: usize,
     };
     match *row {
         Row::Project(pi) => {
+            if projects[pi].collapsed == collapsed {
+                return;
+            }
             projects[pi].collapsed = collapsed;
             let k = format!("c:{}", projects[pi].id);
             if collapsed {
@@ -2723,6 +2834,9 @@ fn fold_at(projects: &mut [Project], mem: &mut Memory, rows: &[Row], idx: usize,
             sync_collapse(projects, mem);
         }
         Row::Worktree(pi, wi) => {
+            if projects[pi].worktrees[wi].collapsed == collapsed {
+                return;
+            }
             projects[pi].worktrees[wi].collapsed = collapsed;
             let k = format!("w:{}", projects[pi].worktrees[wi].key);
             if collapsed {
@@ -2849,8 +2963,7 @@ fn sync_collapse(projects: &[Project], mem: &mut Memory) {
     save_state(mem, true);
 }
 
-/// Identity of the visible frame. Equal signatures skip the draw entirely,
-/// so idle costs nothing and remote ships nothing.
+/// Identity of the rendered inputs. Equal signatures skip terminal drawing.
 struct SigInput<'a> {
     projects: &'a [Project],
     rows: &'a [Row],
@@ -2872,7 +2985,7 @@ struct SigInput<'a> {
     settings_obj: &'a crate::config::Settings,
 }
 
-fn signature(input: &SigInput) -> String {
+fn signature(input: &SigInput, sig: &mut String) {
     let SigInput {
         projects,
         rows,
@@ -2896,33 +3009,38 @@ fn signature(input: &SigInput) -> String {
     // Every rendered input is hashed: footer mode, focus dot, tab-driven
     // indent, and theme colors (the per-second theme reload must repaint on
     // real change and skip on none).
-    let mut sig = format!(
+    sig.clear();
+    write!(
+        sig,
         "{selected}:{offset}:{height}:{hover:?}:{step}:{query}:{compact}:{}:{status}:{filtering}:{font_dialog}:{font}:{:?}:{:?}:{:?}:{:?}:{settings_dialog}:{settings_row}:{settings_obj:?}:",
         view as u8, theme.working, theme.blocked, theme.done, theme.idle,
-    );
+    ).unwrap();
     for (i, row) in rows.iter().enumerate() {
         match *row {
             Row::Project(pi) => {
                 let p = &projects[pi];
-                sig.push_str(&format!(
+                write!(
+                    sig,
                     "{i}:P:{}:{}:{}:{}:{};",
                     p.name, p.branch, p.collapsed, p.pinned, p.focused
-                ));
+                )
+                .unwrap();
             }
             Row::Worktree(pi, wi) => {
                 let w = &projects[pi].worktrees[wi];
-                sig.push_str(&format!("{i}:W:{}:{}:{};", w.name, w.branch, w.collapsed));
+                write!(sig, "{i}:W:{}:{}:{};", w.name, w.branch, w.collapsed).unwrap();
             }
             Row::Agent(pi, wi, ai) => {
                 let a = &projects[pi].worktrees[wi].agents[ai];
-                sig.push_str(&format!(
+                write!(
+                    sig,
                     "{i}:A:{}:{}:{}:{}:{}:{};",
                     a.vendor, a.label, a.title, a.state as u8, a.tab_id, a.focused
-                ));
+                )
+                .unwrap();
             }
         }
     }
-    sig
 }
 
 #[cfg(test)]
@@ -3390,6 +3508,7 @@ mod tests {
             workspace_id: String::new(),
             cwd: "/repo".into(),
             foreground_cwd: None,
+            agent_session: None,
             focused: false,
             state_change_seq: 0,
             title: Some("Supplied".into()),
@@ -3511,5 +3630,22 @@ mod tests {
         let some = visible(&projects, "oauth", false, View::Grouped);
         assert!(some.len() < all);
         assert!(matches!(some[0], Row::Project(0)));
+    }
+
+    #[test]
+    fn fold_at_skips_noop_transitions() {
+        let mut projects = stub();
+        let rows = visible(&projects, "", false, View::Grouped);
+        let mut mem = Memory::default();
+        assert!(!projects[0].collapsed);
+        fold_at(&mut projects, &mut mem, &rows, 0, false);
+        assert!(mem.last_state_save.is_none());
+        fold_at(&mut projects, &mut mem, &rows, 0, true);
+        assert!(projects[0].collapsed);
+        let saved_at = mem.last_state_save;
+        assert!(saved_at.is_some());
+        assert!(mem.collapsed_projects.contains(&projects[0].id));
+        fold_at(&mut projects, &mut mem, &rows, 0, true);
+        assert_eq!(mem.last_state_save, saved_at);
     }
 }

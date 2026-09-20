@@ -1,16 +1,9 @@
 use std::io::{self, Write};
 
-/// Tab-bar entry point: Herdr's tab_bar_right command invokes this with the
-/// active context in env. No shared file, no second scheduler, no polling.
+/// Herdr supplies the active cwd. Read its Git HEAD without querying the server.
 pub fn format_tabbar() -> io::Result<()> {
     let cwd = std::env::var("HERDR_ACTIVE_PANE_CWD").unwrap_or_default();
-    // Pane cwds can sit anywhere (nested dirs, linked checkouts, even spaces
-    // Herdr hasn't opened): longest-prefix across every repo's checkout map.
-    let branch = checkout_branch_map()
-        .into_iter()
-        .filter(|(path, _)| cwd == *path || cwd.starts_with(&format!("{path}/")))
-        .max_by_key(|(path, _)| path.len())
-        .map(|(_, branch)| branch);
+    let branch = crate::native::git_branch(std::path::Path::new(&cwd));
     print!("{}", compose_tabbar(cwd_opt(&cwd), branch.as_deref()));
     io::stdout().flush()
 }
@@ -21,30 +14,6 @@ fn cwd_opt(cwd: &str) -> Option<&str> {
     } else {
         Some(cwd)
     }
-}
-
-/// Every known checkout across repos: spaceless worktrees included.
-fn checkout_branch_map() -> std::collections::BTreeMap<String, String> {
-    let roots: Vec<String> = crate::ipc::call("workspace.list", serde_json::json!({}))
-        .ok()
-        .and_then(|list| list.get("workspaces")?.as_array().cloned())
-        .map(|spaces| {
-            let mut roots: Vec<String> = spaces
-                .iter()
-                .filter_map(|w| {
-                    w["worktree"]
-                        .get("repo_root")?
-                        .as_str()
-                        .filter(|r| !r.is_empty())
-                        .map(str::to_owned)
-                })
-                .collect();
-            roots.sort();
-            roots.dedup();
-            roots
-        })
-        .unwrap_or_default();
-    crate::ipc::branch_map(&roots)
 }
 
 pub fn compose_tabbar(cwd: Option<&str>, branch: Option<&str>) -> String {

@@ -515,13 +515,12 @@ fn install(
             "ui.tab_bar_right_separator",
             Some(value(" · ")),
         )?;
-        // Herdr schedules and dedups the command itself, supplying the
-        // active context; the formatter resolves branch natively per tick.
+        // Herdr owns scheduling. The formatter reads only the active cwd's HEAD.
         let exe = std::env::current_exe()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
         let tabbar_block = parse(&format!(
-            r#"tab_bar_right = [{{ type = 'command', command = "'{exe}' --format-tabbar", interval_seconds = 6, timeout_seconds = 2 }}]"#
+            r#"tab_bar_right = [{{ type = 'command', command = "exec '{exe}' --format-tabbar", interval_seconds = 6, timeout_seconds = 2 }}]"#
         ))?;
         own(
             document,
