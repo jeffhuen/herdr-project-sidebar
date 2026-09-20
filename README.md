@@ -8,14 +8,27 @@ These are separate presentation implementations, not interchangeable skins.
 Both use Herdr's agent and workspace state. The dock uses native APIs for
 navigation and pane placement; native-sidebar styling does not control it.
 
-## Build and enable
+## Install v0.2.0
 
-Requires Herdr 0.9.1+, Rust 1.89+, and Linux or macOS.
+Requires Herdr 0.9.1+, Rust 1.89+, Git, and Linux or macOS.
 
 ```sh
-cargo build --release
-cargo test --release
-herdr plugin link /path/to/herdr-project-sidebar
+herdr plugin install jeffhuen/herdr-project-sidebar --ref v0.2.0
+herdr plugin action invoke configure --plugin herdr-project-sidebar
+```
+
+Herdr builds the plugin from source. The release has no precompiled binaries.
+See the [changelog](CHANGELOG.md) for changes and known limitations.
+This release was verified on Linux; macOS runtime behavior was not checked.
+
+## Build and link a checkout
+
+```sh
+git clone --branch v0.2.0 --depth 1 https://github.com/jeffhuen/herdr-project-sidebar.git
+cd herdr-project-sidebar
+cargo build --release --locked
+cargo test --release --locked
+herdr plugin link .
 herdr plugin action invoke configure --plugin herdr-project-sidebar
 ```
 
@@ -23,6 +36,15 @@ herdr plugin action invoke configure --plugin herdr-project-sidebar
 one controller per server, applies native row styling, and opens the dock when
 automatic opening is enabled. Future server starts launch the controller
 automatically. No server restart is needed.
+
+Before rebuilding an already linked checkout, stop the old controller:
+
+```sh
+herdr plugin action invoke unconfigure --plugin herdr-project-sidebar
+```
+
+After the build, run the configure action again. This replaces the plugin's
+controller and dock without restarting Herdr or closing agent panes.
 
 ## Controls
 
@@ -68,7 +90,9 @@ herdr plugin config-dir herdr-project-sidebar
 - **Order:** project/worktree groups in workspace order, or recent native state
   changes. Both views share this preference; the dock's `v` shortcut updates it.
   This does not create a separate activity history.
-- **Branches:** worktree headers and native Spaces branch/git-status rows.
+- **Branches:** use branch names for linked-worktree headings in the native
+  Agents list. When off, use workspace labels. This does not control dock
+  headers or Herdr's own Spaces rows.
 - **Task titles:** show the native session title (including title overrides) in
   both views, or just the agent name.
 - **Quiet idle titles:** currently has no effect. Both renderers use their idle
@@ -76,6 +100,7 @@ herdr plugin config-dir herdr-project-sidebar
 - **Agent icons:** text, compact font, or none. Text is the default.
   **None** keeps the agent name and status marks.
 - **Sidebar style:** Projects or your previous Herdr rows, also on `prefix+p`.
+  This changes the native lists only, not the terminal dock.
 - **Install compact font:** copies the optional face into your user font directory.
   Both settings popups show installation instructions or an error.
 
