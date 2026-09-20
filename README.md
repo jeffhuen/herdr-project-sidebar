@@ -32,7 +32,8 @@ automatically. No server restart is needed.
   closes before the action runs.
 - In the dock, `j/k` or arrows browse, `Enter` activates, and `h/l` fold/unfold.
   Browsing does not snap back after a timeout. Click and release on a row to
-  activate it. `p` pins, `/` filters, `[`/`]` change width, and `q` closes.
+  activate it. `v` switches the saved order, `p` pins, `/` filters,
+  `[`/`]` change width, and `q` closes.
   Agent counts and **Settings** appear in the bottom bar. The settings popup opens above it.
 - `prefix+p` switches between Projects styling and your previous Herdr rows.
   It changes both the row layout and the sort override, without moving focus,
@@ -65,14 +66,18 @@ herdr plugin config-dir herdr-project-sidebar
 - **Auto open:** create a missing dock in tabs you have not manually
   closed it in. An already open dock continues following when this is off.
 - **Order:** project/worktree groups in workspace order, or recent native state
-  changes. This does not create a separate activity history.
+  changes. Both views share this preference; the dock's `v` shortcut updates it.
+  This does not create a separate activity history.
 - **Branches:** worktree headers and native Spaces branch/git-status rows.
-- **Task titles:** the native session title (including title overrides), or just the agent name.
+- **Task titles:** show the native session title (including title overrides) in
+  both views, or just the agent name.
 - **Quiet idle titles:** currently has no effect. Both renderers use their idle
   colors regardless of this setting.
 - **Agent icons:** text, compact font, or none. Text is the default.
+  **None** keeps the agent name and status marks.
 - **Sidebar style:** Projects or your previous Herdr rows, also on `prefix+p`.
 - **Install compact font:** copies the optional face into your user font directory.
+  Both settings popups show installation instructions or an error.
 
 Working titles are bold, blocked titles red, native completions green, and unknown
 states purple. Agent logos use vendor colors. Project groups have aligned rows

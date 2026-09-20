@@ -1767,6 +1767,29 @@ pub fn run() -> io::Result<()> {
             }
             last_config = std::time::Instant::now();
         }
+        let next_view = if settings_obj.grouped {
+            View::Grouped
+        } else {
+            View::Recent
+        };
+        if next_view != view {
+            let previous_rows = visible(&projects, &query, compact, view);
+            let key = row_key(&projects, &previous_rows, selected)
+                .map(|(kind, id)| (kind, id.to_owned()));
+            view = next_view;
+            let current_rows = visible(&projects, &query, compact, view);
+            selected = restore_selection(
+                &projects,
+                &current_rows,
+                key.as_ref().map(|(kind, id)| (*kind, id.as_str())),
+                browsing || filtering || settings_dialog || confirm_close.is_some(),
+            );
+            offset = 0;
+            hover = None;
+            pressed = None;
+            pending_activation = None;
+            confirm_close = None;
+        }
         let refresh = sync.poll().and_then(|snap| {
             let Some(snap) = snap else { return Ok(None) };
             let fresh = install_snapshot(&snap, &mut mem, &theme.projects, font)?;
@@ -1970,7 +1993,10 @@ pub fn run() -> io::Result<()> {
                         let (glyph, _) = state_glyph(a.state, tick, font);
                         let v_color = vendor_color(&a.vendor);
                         let icon_mode = settings_obj.icons;
-                        let logo = crate::icons::logo(&a.vendor, icon_mode).unwrap_or(&a.vendor);
+                        let label = match crate::icons::logo(&a.vendor, icon_mode) {
+                            Some(logo) => format!("{logo} {}", a.label),
+                            None => a.label.clone(),
+                        };
                         // First row of a tab sits shallow; later same-tab rows
                         // hang deeper off their tab leader. Same-tab agents are
                         // contiguous by sort, so this never nests foreign tabs.
@@ -2001,12 +2027,16 @@ pub fn run() -> io::Result<()> {
                                     .add_modifier(Modifier::BOLD),
                             ),
                             Span::raw(" "),
+                            Span::styled(label, Style::default().fg(v_color)),
+                            Span::raw(if settings_obj.show_title { " · " } else { "" }),
                             Span::styled(
-                                format!("{logo} {}", a.label),
-                                Style::default().fg(v_color),
+                                if settings_obj.show_title {
+                                    a.title.as_str()
+                                } else {
+                                    ""
+                                },
+                                title_style,
                             ),
-                            Span::raw(" · "),
-                            Span::styled(&a.title, title_style),
                         ];
                         if a.state == State::IdleStale {
                             for s in &mut spans {
@@ -2172,7 +2202,11 @@ pub fn run() -> io::Result<()> {
                     }
                     let help_y = card_rect.y + 2 + (shown as u16) * 2 + 1;
                     if help_y < card_rect.bottom().saturating_sub(2) {
-                        let help_text = crate::settings::HELP[settings_row];
+                        let help_text = if status_line.is_empty() {
+                            crate::settings::HELP[settings_row]
+                        } else {
+                            &status_line
+                        };
                         f.render_widget(
                             Paragraph::new(help_text).wrap(ratatui::widgets::Wrap { trim: true }).style(Style::default().fg(theme.dim)),
                             ratatui::layout::Rect::new(card_rect.x + 2, help_y, card_rect.width.saturating_sub(4), card_rect.bottom().saturating_sub(help_y + 1)),
@@ -2275,7 +2309,6 @@ pub fn run() -> io::Result<()> {
                         | KeyCode::Char('q')
                         | KeyCode::Char('c') => {
                             settings_dialog = false;
-                            let _ = crate::config::update(|s| *s = settings_obj.clone());
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
                             settings_row = settings_row.saturating_sub(1);
@@ -2285,12 +2318,14 @@ pub fn run() -> io::Result<()> {
                                 .min(crate::settings::LABELS.len().saturating_sub(1));
                         }
                         KeyCode::Left | KeyCode::Char('h') => {
-                            crate::settings::change(&mut settings_obj, settings_row, false);
-                            crate::config::update(|s| *s = settings_obj.clone())?;
+                            status_line =
+                                crate::settings::apply(&mut settings_obj, settings_row, false)
+                                    .unwrap_or_else(|error| error.to_string());
                         }
                         KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
-                            crate::settings::change(&mut settings_obj, settings_row, true);
-                            crate::config::update(|s| *s = settings_obj.clone())?;
+                            status_line =
+                                crate::settings::apply(&mut settings_obj, settings_row, true)
+                                    .unwrap_or_else(|error| error.to_string());
                         }
                         _ => {}
                     }
@@ -2380,13 +2415,8 @@ pub fn run() -> io::Result<()> {
                         offset = 0;
                     }
                     KeyCode::Char('v') => {
-                        view = if view == View::Grouped {
-                            View::Recent
-                        } else {
-                            View::Grouped
-                        };
-                        selected = 0;
-                        offset = 0;
+                        status_line = crate::settings::apply(&mut settings_obj, 3, true)
+                            .unwrap_or_else(|error| error.to_string());
                     }
                     KeyCode::Char('c') => compact = !compact,
                     KeyCode::Char('F') => font_dialog = true,
@@ -2550,26 +2580,25 @@ pub fn run() -> io::Result<()> {
                     pending_activation = None;
                     confirm_close = None;
                     if settings_dialog {
-                        match modal_hit(m.column, m.row, close_btn, less_btn, more_btn, &row_rects)
-                        {
+                        let edit = match modal_hit(
+                            m.column, m.row, close_btn, less_btn, more_btn, &row_rects,
+                        ) {
                             Some(ModalHit::Close) => {
                                 settings_dialog = false;
-                                let _ = crate::config::update(|s| *s = settings_obj.clone());
+                                status_line.clear();
+                                None
                             }
-                            Some(ModalHit::Less) => {
-                                crate::settings::change(&mut settings_obj, 0, false);
-                                crate::config::update(|s| *s = settings_obj.clone())?;
-                            }
-                            Some(ModalHit::More) => {
-                                crate::settings::change(&mut settings_obj, 0, true);
-                                crate::config::update(|s| *s = settings_obj.clone())?;
-                            }
+                            Some(ModalHit::Less) => Some((0, false)),
+                            Some(ModalHit::More) => Some((0, true)),
                             Some(ModalHit::Row(i)) => {
                                 settings_row = i;
-                                crate::settings::change(&mut settings_obj, i, true);
-                                let _ = crate::config::update(|s| *s = settings_obj.clone());
+                                Some((i, true))
                             }
-                            None => {}
+                            None => None,
+                        };
+                        if let Some((row, forward)) = edit {
+                            status_line = crate::settings::apply(&mut settings_obj, row, forward)
+                                .unwrap_or_else(|error| error.to_string());
                         }
                         continue;
                     }
@@ -2581,6 +2610,7 @@ pub fn run() -> io::Result<()> {
                             && m.row < r.y + r.height
                     };
                     if contains(settings_btn) {
+                        status_line.clear();
                         settings_dialog = true;
                         settings_obj = crate::config::load().unwrap_or_default();
                         continue;
@@ -2610,6 +2640,9 @@ pub fn run() -> io::Result<()> {
                         if let Some(ModalHit::Row(i)) =
                             modal_hit(m.column, m.row, close_btn, less_btn, more_btn, &row_rects)
                         {
+                            if settings_row != i {
+                                status_line.clear();
+                            }
                             settings_row = i;
                         }
                     } else {
@@ -2619,6 +2652,7 @@ pub fn run() -> io::Result<()> {
                 MouseEventKind::ScrollDown => {
                     pending_activation = None;
                     if settings_dialog {
+                        status_line.clear();
                         settings_row =
                             (settings_row + 1).min(crate::settings::LABELS.len().saturating_sub(1));
                     } else {
@@ -2635,6 +2669,7 @@ pub fn run() -> io::Result<()> {
                 MouseEventKind::ScrollUp => {
                     pending_activation = None;
                     if settings_dialog {
+                        status_line.clear();
                         settings_row = settings_row.saturating_sub(1);
                     } else {
                         confirm_close = None;
@@ -2941,6 +2976,26 @@ mod tests {
             restore_selection(&projects, &rows, None, true),
             NO_SELECTION
         );
+    }
+
+    #[test]
+    fn changing_order_preserves_agent_targets_and_clears_hidden_headers() {
+        let projects = stub();
+        let grouped = visible(&projects, "", false, View::Grouped);
+        let agent = row_index(&projects, &grouped, (2, "alpha")).unwrap();
+        let recent = visible(&projects, "", false, View::Recent);
+        let selected = restore_selection(
+            &projects,
+            &recent,
+            row_key(&projects, &grouped, agent),
+            true,
+        );
+        assert_eq!(
+            activation_target(&projects, &recent, selected),
+            Some(Activation::Session("w1:p1".into()))
+        );
+        let selected = restore_selection(&projects, &recent, Some((0, "stub-a")), true);
+        assert_eq!(activation_target(&projects, &recent, selected), None);
     }
 
     #[test]

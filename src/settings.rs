@@ -83,7 +83,7 @@ pub fn values(settings: &Settings) -> [String; 10] {
     ]
 }
 
-pub fn change(settings: &mut Settings, row: usize, forward: bool) {
+fn change(settings: &mut Settings, row: usize, forward: bool) {
     match row {
         0 => {
             settings.width = if forward {
@@ -108,6 +108,22 @@ pub fn change(settings: &mut Settings, row: usize, forward: bool) {
         8 => settings.project_style = !settings.project_style,
         _ => {}
     }
+}
+
+pub fn apply(settings: &mut Settings, row: usize, forward: bool) -> io::Result<String> {
+    if row == 9 {
+        return crate::icons::install().map(|_| "Installed. Map U+E1A0-U+E1B0 to Herdr Agent Icons Compact in your terminal, then choose Font.".to_owned());
+    }
+    *settings = config::update(|current| change(current, row, forward))?;
+    crate::reload()
+        .map_err(|error| io::Error::other(format!("Saved; Herdr reload failed: {error}")))?;
+    crate::native::start()?;
+    Ok(if row == 2 {
+        "Saved. An open dock still follows tabs; manually closed tabs stay snoozed."
+    } else {
+        "Saved."
+    }
+    .to_owned())
 }
 
 pub fn run() -> io::Result<()> {
@@ -252,24 +268,8 @@ pub fn run() -> io::Result<()> {
             dirty = true;
         }
         if let Some(forward) = edit {
-            let result = if selected == 9 {
-                crate::icons::install().map(|_| "Installed. Map U+E1A0-U+E1B0 to Herdr Agent Icons Compact in your terminal, then choose Font.".to_owned())
-            } else {
-                config::update(|current| change(current, selected, forward)).and_then(|saved| {
-                    settings = saved;
-                    crate::reload().map_err(|error| {
-                        io::Error::other(format!("Saved; Herdr reload failed: {error}"))
-                    })?;
-                    crate::native::start()?;
-                    Ok(if selected == 2 {
-                        "Saved. An open dock still follows tabs; manually closed tabs stay snoozed."
-                    } else {
-                        "Saved."
-                    }
-                    .to_owned())
-                })
-            };
-            message = result.unwrap_or_else(|error| error.to_string());
+            message =
+                apply(&mut settings, selected, forward).unwrap_or_else(|error| error.to_string());
             dirty = true;
         }
     }
