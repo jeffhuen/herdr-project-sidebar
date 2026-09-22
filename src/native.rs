@@ -1060,12 +1060,13 @@ pub fn rows(input: &RowsInput) -> (RowTokens, RowTokens) {
             .and_then(Value::as_u64)
             .unwrap_or(0)
     }
+    // Group boundaries must use the same group-first order as agent.view.set.
     ordered.sort_by(|a, b| {
         let wa = &spaces[text(a, "workspace_id")];
         let wb = &spaces[text(b, "workspace_id")];
         (
+            settings.grouped.then_some(&wa.group),
             seq(b),
-            &wa.group,
             wa.linked,
             wa.order,
             &wa.id,
@@ -1080,8 +1081,8 @@ pub fn rows(input: &RowsInput) -> (RowTokens, RowTokens) {
             text(a, "pane_id"),
         )
             .cmp(&(
+                settings.grouped.then_some(&wb.group),
                 seq(a),
-                &wb.group,
                 wb.linked,
                 wb.order,
                 &wb.id,
@@ -1151,8 +1152,10 @@ pub fn rows(input: &RowsInput) -> (RowTokens, RowTokens) {
         let vendor = text(agent, "agent");
         let logo_glyph = icons::logo(vendor, settings.icons);
         if let Some(glyph) = logo_glyph {
-            let logo_str = format!("{indent}{glyph}");
             tokens.insert("harness_logo".into(), json!(glyph));
+        }
+        if settings.icons != config::IconMode::None {
+            let logo_str = format!("{indent}{}", logo_glyph.unwrap_or(vendor));
             match display {
                 "working" => tokens.insert("logo_working".into(), json!(logo_str)),
                 "idle_stale" => tokens.insert("logo_stale".into(), json!(logo_str)),
@@ -1254,6 +1257,42 @@ pub fn git_branch(start: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn group_boundaries_follow_native_sort_with_interleaved_recency() {
+        let agents = vec![
+            json!({"pane_id":"a-new", "workspace_id":"a", "agent":"omp", "agent_status":"idle", "state_change_seq":40}),
+            json!({"pane_id":"muse", "workspace_id":"b", "agent":"muse", "agent_status":"idle", "terminal_title_stripped":"muse-bridge", "state_change_seq":30}),
+            json!({"pane_id":"a-old", "workspace_id":"a", "agent":"omp", "agent_status":"idle", "state_change_seq":20}),
+            json!({"pane_id":"b-old", "workspace_id":"b", "agent":"omp", "agent_status":"idle", "state_change_seq":10}),
+        ];
+        let workspaces = vec![
+            json!({"workspace_id":"a", "label":"project"}),
+            json!({"workspace_id":"b", "label":"muse-bridge"}),
+        ];
+        let settings = config::Settings {
+            show_branch: false,
+            ..config::Settings::default()
+        };
+        let (panes, _) = rows(&RowsInput {
+            agents: &agents,
+            workspaces: &workspaces,
+            tabs: &[],
+            panes: &[],
+            settings: &settings,
+            activity: &ActivityStore::default(),
+            now_ms: 0,
+            spin_step: 0,
+        });
+
+        assert_eq!(panes["a-new"]["gap"], Value::Null);
+        assert_eq!(panes["a-old"]["gap"], json!("\u{200b}"));
+        assert_eq!(panes["muse"]["gap"], Value::Null);
+        assert_eq!(panes["b-old"]["gap"], Value::Null);
+        assert_eq!(panes["a-old"]["group"], Value::Null);
+        assert_eq!(panes["b-old"]["group"], Value::Null);
+        assert_eq!(panes["muse"]["logo"], "muse");
+        assert_eq!(panes["muse"]["title_idle"], "muse-bridge");
+    }
 
     #[test]
     fn metadata_delta_does_not_repeat_cleared_tokens() {

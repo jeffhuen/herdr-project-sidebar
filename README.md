@@ -77,8 +77,8 @@ Herdr's native sidebar stays on the left. The terminal dock supports either side
 
 ### Copy references (Unreleased)
 
-In the terminal dock, press `m` on a browsed row or use `Ctrl+right-click` to
-forward the click through Herdr. Plain right-click also works when forwarded.
+In the terminal dock, right-click a row or press `m` on a browsed row.
+The dock enables Herdr's per-pane right-click forwarding when it starts.
 Use arrows or `j/k`, then `Enter`, or click an action. `Esc` or an outside click
 closes the menu without activating a row or changing which groups are folded.
 

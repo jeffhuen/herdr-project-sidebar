@@ -1720,6 +1720,13 @@ pub fn run() -> io::Result<()> {
         );
         return Ok(());
     }
+    // Herdr otherwise consumes plain right-clicks before they reach the dock.
+    if let Ok(pane_id) = std::env::var("HERDR_PANE_ID") {
+        crate::ipc::call(
+            "pane.input.set",
+            serde_json::json!({"pane_id": pane_id, "right_click": "pane"}),
+        )?;
+    }
 
     let mut mem = Memory {
         activity: ActivityStore::new(crate::config::state_dir().join("dock")),

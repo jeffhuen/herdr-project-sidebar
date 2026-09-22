@@ -5,7 +5,7 @@
 ### Added
 
 - Copy-only menus for project, worktree, and agent rows in the terminal dock.
-  Open with `m` or a forwarded right-click (`Ctrl+right-click` in Herdr).
+  Open with `m` or right-click.
 - Copy individual paths and native IDs, or a JSON reference with host and Herdr
   socket context. Agent session paths remain distinct from terminal and pane IDs.
 - Forward clipboard writes through Herdr to the viewing client using OSC 52,
@@ -27,6 +27,12 @@
 
 ### Fixed
 
+- Place native-sidebar separators between project groups rather than between
+  sessions whose global recency interleaves with another project.
+- Label agents without mapped icons by harness name, so sessions such as Muse
+  remain distinct from project headings. Explicitly disabled icons stay hidden.
+- Route plain right-clicks to the dock on startup so reopening it preserves access
+  to its reference menus.
 - Repaint open copy menus only when their visible state changes. Repeated mouse
   motion over the same item and ignored keys no longer produce terminal writes;
   selection changes and copy errors still repaint.
