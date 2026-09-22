@@ -444,10 +444,10 @@ fn run_inner() -> io::Result<()> {
                                 && plugin["enabled"] == true
                         });
                     if !enabled {
-                        config::unconfigure()?;
+                        let unconfigured = config::unconfigure();
                         settings.enabled = false;
                         sync.invalidate();
-                        crate::reload()?;
+                        unconfigured?;
                     }
                 }
                 let result = refresh_daemon(&mut publisher, &mut controller, &snapshot, &settings);
@@ -469,9 +469,9 @@ fn run_inner() -> io::Result<()> {
         {
             animation_at = Instant::now();
             animation_session.as_ref().map(|session| {
-                publisher
-                    .animate(session, (now_unix_ms() / SPIN_MS) as usize)
-                    .map(|_| true)
+                // EXPERIMENT (remote-lag): freeze timer updates as well as snapshots.
+                // publisher.animate(session, (now_unix_ms() / SPIN_MS) as usize).map(|_| true)
+                publisher.animate(session, 0).map(|_| true)
             })
         } else {
             refreshed
@@ -557,6 +557,27 @@ fn empty_tokens(keys: &[&str]) -> Tokens {
 
 fn retain_delta(tokens: &mut Tokens, live: Option<&Value>) {
     tokens.retain(|key, value| {
+        if let Value::String(text) = value {
+            // Match Herdr 0.9.1 metadata normalization, in place: trim, remove
+            // controls, limit to 80 Unicode characters, then trim again.
+            let leading = text.len() - text.trim_start().len();
+            text.drain(..leading);
+            text.truncate(text.trim_end().len());
+            let mut remaining = 80;
+            text.retain(|ch| {
+                if ch.is_control() || remaining == 0 {
+                    return false;
+                }
+                remaining -= 1;
+                true
+            });
+            let leading = text.len() - text.trim_start().len();
+            text.drain(..leading);
+            text.truncate(text.trim_end().len());
+            if text.is_empty() {
+                *value = Value::Null;
+            }
+        }
         live.and_then(|tokens| tokens.get(key))
             .unwrap_or(&Value::Null)
             != &*value
@@ -778,7 +799,9 @@ impl Publisher {
         }
         self.native_style = false;
 
-        let spin_step = (now_ms / SPIN_MS) as usize;
+        // EXPERIMENT (remote-lag): static spinner mark; revert to the line below.
+        let spin_step = 0;
+        // let spin_step = (now_ms / SPIN_MS) as usize;
 
         // 2. Generate row tokens
         let (wanted, wanted_workspaces) = rows(&RowsInput {
@@ -1250,6 +1273,37 @@ mod tests {
             Some(&json!({"same": "label", "changed": "new"})),
         );
         assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn metadata_delta_converges_after_wire_normalization() {
+        let wanted = json!({
+            "title_working": format!("⣷ {}", "文".repeat(80)),
+            "group": "  pro\u{0000}ject\n ",
+            "empty": "\u{0000} \n",
+            "boundary": format!("{} suffix", "x".repeat(79))
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let mut tokens = wanted.clone();
+        retain_delta(&mut tokens, None);
+        let mut live = json!({
+            "title_working": format!("⣷ {}", "文".repeat(78)),
+            "group": "project",
+            "boundary": "x".repeat(79)
+        });
+        assert_eq!(json!(tokens), live);
+        let mut tokens = wanted.clone();
+        retain_delta(&mut tokens, Some(&live));
+        assert!(tokens.is_empty());
+        live["title_working"] = json!("externally changed");
+        let mut tokens = wanted;
+        retain_delta(&mut tokens, Some(&live));
+        assert_eq!(
+            json!(tokens),
+            json!({"title_working": format!("⣷ {}", "文".repeat(78))})
+        );
     }
 
     #[test]

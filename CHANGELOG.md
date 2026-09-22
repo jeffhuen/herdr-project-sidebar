@@ -15,8 +15,8 @@
 
 ### Changed
 
-- Use a 250ms interval for decorative animation. Patch cached native title
-  marks without fetching snapshots or reconciling dock placement on each frame.
+- Restore dock-only animation at a 300ms interval. Keep native spinner marks static
+  during the remote-lag trial without disabling status or title updates.
   Title-only changes without a subscribed event can take about five seconds to appear.
 - Animate only working rows in the dock's rendered window, reuse frame-signature
   buffers, and reduce idle polling while preserving immediate keyboard wakeups.

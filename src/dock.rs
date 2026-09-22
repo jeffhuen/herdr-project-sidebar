@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
 use std::io;
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::activity::{now_unix_ms, ActivityStore, Freshness};
@@ -31,7 +32,7 @@ use serde::Deserialize;
 mod menu;
 
 const SPINNER: [&str; 8] = ["⣷", "⣯", "⣟", "⡿", "⢿", "⣻", "⣽", "⣾"];
-const TICK: Duration = Duration::from_millis(250);
+const TICK: Duration = Duration::from_millis(300);
 const IDLE_POLL: Duration = Duration::from_millis(300);
 const NO_SELECTION: usize = usize::MAX;
 const BRANCH_TTL: Duration = Duration::from_secs(5);
@@ -1272,15 +1273,15 @@ fn state_path() -> std::path::PathBuf {
     crate::config::state_dir().join("state.json")
 }
 
-fn read_state_file() -> serde_json::Value {
-    std::fs::read_to_string(state_path())
+fn read_state_file(path: &Path) -> serde_json::Value {
+    std::fs::read_to_string(path)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_default()
 }
 
-fn load_state(mem: &mut Memory) {
-    let v = read_state_file();
+fn load_state(mem: &mut Memory, path: &Path) {
+    let v = read_state_file(path);
     let get = |k: &str| {
         v.get(k)
             .and_then(|x| x.as_array())
@@ -1338,7 +1339,7 @@ fn apply_dropped(mem: &mut Memory) {
     }
 }
 
-fn save_state(mem: &mut Memory, force: bool) {
+fn save_state(mem: &mut Memory, force: bool, path: &Path) {
     let now = std::time::Instant::now();
     // True debounce: nothing dirty means nothing to write, dirty means wait
     // out the interval so bursts coalesce into one write.
@@ -1360,7 +1361,7 @@ fn save_state(mem: &mut Memory, force: bool) {
     // file's dropped set (another dock's unpin applies here too), republish
     // the merge, prune vetoes nothing holds anymore. Explicit holds here
     // (touched) overrule adopted vetoes, so a deliberate re-pin sticks.
-    let file = read_state_file();
+    let file = read_state_file(path);
     mem.dropped.extend(
         file.get("dropped")
             .and_then(|x| x.as_array())
@@ -1396,7 +1397,6 @@ fn save_state(mem: &mut Memory, force: bool) {
         "font_choice": mem.font_choice,
         "dropped": mem.dropped.iter().collect::<Vec<_>>(),
     });
-    let path = state_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -1678,13 +1678,14 @@ impl Drop for TermGuard {
 }
 
 pub fn run() -> io::Result<()> {
+    let state_path = state_path();
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--dump-snapshot") {
         let mut mem = Memory {
             activity: ActivityStore::new(crate::config::state_dir().join("dock")),
             ..Memory::default()
         };
-        load_state(&mut mem);
+        load_state(&mut mem, &state_path);
         let font = use_font(&mem.font_choice, font_ok());
         let theme = load_theme();
         let result = (|| {
@@ -1724,7 +1725,7 @@ pub fn run() -> io::Result<()> {
         activity: ActivityStore::new(crate::config::state_dir().join("dock")),
         ..Memory::default()
     };
-    load_state(&mut mem);
+    load_state(&mut mem, &state_path);
     // Glyph set: explicit choice wins, auto detects once. The notice below
     // is the install prompt: it explains what the font is for and remembers.
     let mut font_detected = font_ok();
@@ -1821,6 +1822,7 @@ pub fn run() -> io::Result<()> {
             pressed = None;
             pending_activation = None;
             confirm_close = None;
+            copy_menu.close();
         }
         let refresh = sync.poll().and_then(|snap| {
             let Some(snap) = snap else { return Ok(None) };
@@ -1887,7 +1889,7 @@ pub fn run() -> io::Result<()> {
             .save(false)
             .err()
             .map(|error| error.to_string());
-        save_state(&mut mem, false);
+        save_state(&mut mem, false, &state_path);
         let rows = visible(&projects, &query, compact, view);
         if !sync.is_stale() && sync_error.is_none() {
             if let Some(intent) = pending_activation.take() {
@@ -2306,7 +2308,10 @@ pub fn run() -> io::Result<()> {
                         rect,
                     );
                 }
-                copy_menu.draw(f, &theme, sync_error.is_none() && !sync.is_stale());
+                if copy_menu.is_open() {
+                    let menu_anchor = visual_rows.iter().position(|row| *row == Some(selected));
+                    copy_menu.draw(f, &theme, sync_error.is_none() && !sync.is_stale(), menu_anchor.map(|y| y as u16));
+                }
             })?;
             std::mem::swap(&mut last_drawn, &mut sig);
         }
@@ -2436,7 +2441,7 @@ pub fn run() -> io::Result<()> {
                             font_dialog = false;
                             status_line = "ASCII icons, won't ask again".into();
                             mem.dirty_state = true;
-                            save_state(&mut mem, true);
+                            save_state(&mut mem, true, &state_path);
                             sync.invalidate();
                         }
                         KeyCode::Char('3') => {
@@ -2446,7 +2451,7 @@ pub fn run() -> io::Result<()> {
                             font_dialog = false;
                             status_line = "Nerd Font assumed".into();
                             mem.dirty_state = true;
-                            save_state(&mut mem, true);
+                            save_state(&mut mem, true, &state_path);
                             sync.invalidate();
                         }
                         KeyCode::Esc => font_dialog = false,
@@ -2493,11 +2498,25 @@ pub fn run() -> io::Result<()> {
                         browsing = true;
                     }
                     KeyCode::Left | KeyCode::Char('h') => {
-                        fold_at(&mut projects, &mut mem, &rows, selected, true);
+                        fold_at(
+                            &mut projects,
+                            &mut mem,
+                            &rows,
+                            selected,
+                            Some(true),
+                            &state_path,
+                        );
                         browsing = true;
                     }
                     KeyCode::Right | KeyCode::Char('l') => {
-                        fold_at(&mut projects, &mut mem, &rows, selected, false);
+                        fold_at(
+                            &mut projects,
+                            &mut mem,
+                            &rows,
+                            selected,
+                            Some(false),
+                            &state_path,
+                        );
                         browsing = true;
                     }
                     KeyCode::Char('/') => {
@@ -2574,7 +2593,7 @@ pub fn run() -> io::Result<()> {
                                 projects[pi].pinned = true;
                             }
                             mem.dirty_state = true;
-                            save_state(&mut mem, true);
+                            save_state(&mut mem, true, &state_path);
                         }
                     }
                     KeyCode::Char('D') => {
@@ -2680,6 +2699,8 @@ pub fn run() -> io::Result<()> {
                     hover = None;
                     status_line.clear();
                     if let Some(index) = visual_hit(&visual_rows, m.row) {
+                        selected = index;
+                        browsing = true;
                         copy_menu.open(&projects, &rows, index, (m.column, m.row));
                     }
                 }
@@ -2737,9 +2758,15 @@ pub fn run() -> io::Result<()> {
                 MouseEventKind::Up(MouseButton::Left) => {
                     pending_activation = None;
                     if let Some((kind, id)) = pressed.take() {
-                        if sync_error.is_none() && session.is_some() {
-                            pending_activation = visual_hit(&visual_rows, m.row)
-                                .and_then(|idx| release_target(&projects, &rows, (kind, &id), idx));
+                        if let Some(idx) = visual_hit(&visual_rows, m.row)
+                            .and_then(|idx| release_target(&projects, &rows, (kind, &id), idx))
+                        {
+                            if matches!(rows[idx], Row::Project(_) | Row::Worktree(_, _)) {
+                                fold_at(&mut projects, &mut mem, &rows, idx, None, &state_path);
+                            } else if sync_error.is_none() && session.is_some() {
+                                pending_activation =
+                                    PendingActivation::new(&projects, &rows, idx, false);
+                            }
                         }
                     }
                 }
@@ -2792,7 +2819,7 @@ pub fn run() -> io::Result<()> {
         }
     }
 
-    save_state(&mut mem, true);
+    save_state(&mut mem, true, &state_path);
     mem.activity.save(true)?;
     disable_raw_mode()?;
     execute!(
@@ -2815,12 +2842,21 @@ fn focus_workspace(session: &crate::ipc::Session, workspace_id: &str) -> io::Res
         .map(|_| ())
 }
 
-fn fold_at(projects: &mut [Project], mem: &mut Memory, rows: &[Row], idx: usize, collapsed: bool) {
+// None toggles; keyboard left/right request an explicit state.
+fn fold_at(
+    projects: &mut [Project],
+    mem: &mut Memory,
+    rows: &[Row],
+    idx: usize,
+    collapsed: Option<bool>,
+    path: &Path,
+) {
     let Some(row) = rows.get(idx) else {
         return;
     };
     match *row {
         Row::Project(pi) => {
+            let collapsed = collapsed.unwrap_or(!projects[pi].collapsed);
             if projects[pi].collapsed == collapsed {
                 return;
             }
@@ -2831,9 +2867,10 @@ fn fold_at(projects: &mut [Project], mem: &mut Memory, rows: &[Row], idx: usize,
             } else {
                 touch_release(&mut *mem, &k);
             }
-            sync_collapse(projects, mem);
+            sync_collapse(projects, mem, path);
         }
         Row::Worktree(pi, wi) => {
+            let collapsed = collapsed.unwrap_or(!projects[pi].worktrees[wi].collapsed);
             if projects[pi].worktrees[wi].collapsed == collapsed {
                 return;
             }
@@ -2844,7 +2881,7 @@ fn fold_at(projects: &mut [Project], mem: &mut Memory, rows: &[Row], idx: usize,
             } else {
                 touch_release(&mut *mem, &k);
             }
-            sync_collapse(projects, mem);
+            sync_collapse(projects, mem, path);
         }
         Row::Agent(_, _, _) => {}
     }
@@ -2885,11 +2922,8 @@ fn release_target(
     rows: &[Row],
     pressed: (u8, &str),
     released: usize,
-) -> Option<PendingActivation> {
-    if row_key(projects, rows, released) != Some(pressed) {
-        return None;
-    }
-    PendingActivation::new(projects, rows, released, false)
+) -> Option<usize> {
+    (row_key(projects, rows, released) == Some(pressed)).then_some(released)
 }
 
 /// Keep one row identity, not the native address it had before a refresh.
@@ -2934,7 +2968,7 @@ fn activate_target(session: &crate::ipc::Session, target: Activation) -> io::Res
     }
 }
 
-fn sync_collapse(projects: &[Project], mem: &mut Memory) {
+fn sync_collapse(projects: &[Project], mem: &mut Memory, path: &Path) {
     // Merge, never rebuild: the frame may omit projects (closed workspaces,
     // offline stub) whose saved folds must survive. Unfolds are recorded in
     // dropped so the save-merge can tell them apart from never-known keys.
@@ -2960,7 +2994,7 @@ fn sync_collapse(projects: &[Project], mem: &mut Memory) {
     }
     mem.dirty_state = true;
     // Explicit folds must survive a native pane close before the activity debounce.
-    save_state(mem, true);
+    save_state(mem, true, path);
 }
 
 /// Identity of the rendered inputs. Equal signatures skip terminal drawing.
@@ -3117,7 +3151,7 @@ mod tests {
     }
 
     #[test]
-    fn held_header_click_resolves_current_workspace_and_checks_release_identity() {
+    fn header_click_checks_identity_and_enter_resolves_current_workspace() {
         let mut projects = stub();
         projects[0].workspaces = vec!["old-workspace".into()];
         let rows = visible(&projects, "", false, View::Grouped);
@@ -3126,7 +3160,8 @@ mod tests {
             activation_target(&projects, &rows, header),
             Some(Activation::Space("old-workspace".into()))
         );
-        let pending = release_target(&projects, &rows, (0, "stub-a"), header).unwrap();
+        let clicked = release_target(&projects, &rows, (0, "stub-a"), header).unwrap();
+        let pending = PendingActivation::new(&projects, &rows, clicked, false).unwrap();
         projects[0].workspaces = vec!["current-workspace".into()];
         assert_eq!(
             pending.resolve(&projects, &rows).map(|(_, target)| target),
@@ -3550,42 +3585,41 @@ mod tests {
         // re-pin must stick globally. Deterministic via a temp state dir.
         let dir = std::env::temp_dir().join(format!("hps-conv-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::set_var("HERDR_PLUGIN_STATE_DIR", &dir);
+        let state_path = dir.join("state.json");
         let mut a = Memory::default();
         let mut b = Memory::default();
-        load_state(&mut a);
-        load_state(&mut b);
+        load_state(&mut a, &state_path);
+        load_state(&mut b, &state_path);
         // Legacy pin in the file, nobody touched it this session.
         a.pinned.insert("w1Q".into());
-        save_state(&mut a, true);
-        load_state(&mut b);
+        save_state(&mut a, true, &state_path);
+        load_state(&mut b, &state_path);
         assert!(b.pinned.contains("w1Q"));
         // B unpins: file loses X and carries the veto.
         b.pinned.remove("w1Q");
         touch_release(&mut b, "p:w1Q");
-        save_state(&mut b, true);
+        save_state(&mut b, true, &state_path);
         // A saves with no live hold: adopts the veto, X stays gone.
-        save_state(&mut a, true);
+        save_state(&mut a, true, &state_path);
         assert!(!a.pinned.contains("w1Q"));
         let mut c = Memory::default();
-        load_state(&mut c);
+        load_state(&mut c, &state_path);
         assert!(!c.pinned.contains("w1Q"));
         // Stale holder that missed the veto window: pre-veto memory plus a
         // save must adopt, never resurrect.
         let mut e = Memory::default();
         e.pinned.insert("w1Q".into());
-        save_state(&mut e, true);
+        save_state(&mut e, true, &state_path);
         let mut f = Memory::default();
-        load_state(&mut f);
+        load_state(&mut f, &state_path);
         assert!(!f.pinned.contains("w1Q"));
         // Fresh re-pin in B overrules the veto and sticks globally.
         b.pinned.insert("w1Q".into());
         touch_hold(&mut b, "p:w1Q");
-        save_state(&mut b, true);
+        save_state(&mut b, true, &state_path);
         let mut d = Memory::default();
-        load_state(&mut d);
+        load_state(&mut d, &state_path);
         assert!(d.pinned.contains("w1Q"));
-        std::env::remove_var("HERDR_PLUGIN_STATE_DIR");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3633,19 +3667,59 @@ mod tests {
     }
 
     #[test]
-    fn fold_at_skips_noop_transitions() {
+    fn mixed_folding_preserves_children_and_noop_folds_do_not_write() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = std::env::temp_dir().join(format!("hps-fold-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
         let mut projects = stub();
-        let rows = visible(&projects, "", false, View::Grouped);
         let mut mem = Memory::default();
-        assert!(!projects[0].collapsed);
-        fold_at(&mut projects, &mut mem, &rows, 0, false);
-        assert!(mem.last_state_save.is_none());
-        fold_at(&mut projects, &mut mem, &rows, 0, true);
-        assert!(projects[0].collapsed);
-        let saved_at = mem.last_state_save;
-        assert!(saved_at.is_some());
-        assert!(mem.collapsed_projects.contains(&projects[0].id));
-        fold_at(&mut projects, &mut mem, &rows, 0, true);
-        assert_eq!(mem.last_state_save, saved_at);
+        let rows = visible(&projects, "", false, View::Grouped);
+        let project = row_index(&projects, &rows, (0, "stub-a")).unwrap();
+        fold_at(&mut projects, &mut mem, &rows, project, Some(false), &path);
+        assert!(!path.exists(), "a no-op must not create a state file");
+
+        for (key, project_closed, branch_closed) in [
+            ((1, "stub-a/main"), false, true),
+            ((0, "stub-a"), true, true),
+            ((0, "stub-a"), false, true),
+            ((1, "stub-a/main"), false, false),
+            ((1, "stub-a/main"), false, true),
+            ((1, "stub-a/main"), false, false),
+        ] {
+            let rows = visible(&projects, "", false, View::Grouped);
+            let idx = row_index(&projects, &rows, key).unwrap();
+            assert_eq!(release_target(&projects, &rows, key, idx), Some(idx));
+            fold_at(&mut projects, &mut mem, &rows, idx, None, &path);
+            let rows = visible(&projects, "", false, View::Grouped);
+            assert_eq!(
+                row_index(&projects, &rows, (1, "stub-a/main")).is_none(),
+                project_closed
+            );
+            assert_eq!(
+                row_index(&projects, &rows, (2, "alpha")).is_none(),
+                project_closed || branch_closed
+            );
+            let mut saved = Memory::default();
+            load_state(&mut saved, &path);
+            assert_eq!(saved.collapsed_projects.contains("stub-a"), project_closed);
+            assert_eq!(
+                saved.collapsed_worktrees.contains("stub-a/main"),
+                branch_closed
+            );
+        }
+
+        // Keep the old inode alive: even an identical rewrite would replace it.
+        let saved = std::fs::File::open(&path).unwrap();
+        let inode = saved.metadata().unwrap().ino();
+        let rows = visible(&projects, "", false, View::Grouped);
+        for key in [(0, "stub-a"), (1, "stub-a/main")] {
+            let idx = row_index(&projects, &rows, key).unwrap();
+            fold_at(&mut projects, &mut mem, &rows, idx, Some(false), &path);
+        }
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        drop(saved);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

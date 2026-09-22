@@ -120,8 +120,6 @@ pub fn apply(settings: &mut Settings, row: usize, forward: bool) -> io::Result<S
         return Ok(String::new());
     }
     *settings = config::update(|current| change(current, row, forward))?;
-    crate::reload()
-        .map_err(|error| io::Error::other(format!("Saved; Herdr reload failed: {error}")))?;
     crate::native::start()?;
     Ok(if row == 2 {
         "Saved. An open dock still follows tabs; manually closed tabs stay snoozed."

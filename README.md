@@ -53,8 +53,9 @@ controller and dock without restarting Herdr or closing agent panes.
   Toggle actions retain their originating tab even if the invoking dock pane
   closes before the action runs.
 - In the dock, `j/k` or arrows browse, `Enter` activates, and `h/l` fold/unfold.
-  Browsing does not snap back after a timeout. Click and release on a row to
-  activate it. `v` switches the saved order, `p` pins, `/` filters,
+  Browsing does not snap back after a timeout. Click anywhere on a project or
+  worktree row to fold or unfold it. `Enter` navigates without changing its fold.
+  Click an agent row to activate it. `v` switches the saved order, `p` pins, `/` filters,
   `[`/`]` change width, and `q` closes.
   Agent counts and **Settings** appear in the bottom bar. The settings popup opens above it.
 - `prefix+p` switches between Projects styling and your previous Herdr rows.
@@ -79,7 +80,13 @@ Herdr's native sidebar stays on the left. The terminal dock supports either side
 In the terminal dock, press `m` on a browsed row or use `Ctrl+right-click` to
 forward the click through Herdr. Plain right-click also works when forwarded.
 Use arrows or `j/k`, then `Enter`, or click an action. `Esc` or an outside click
-closes the menu without activating a row.
+closes the menu without activating a row or changing which groups are folded.
+
+The menu dims the surrounding dock and keeps the source row at normal brightness.
+It opens below that row, or above it near the bottom of the dock.
+Its width follows the action labels and keyboard hints.
+Previews wrap at the same indent as the labels. Narrow docks put `[Enter] Copy`
+and `[Esc] Close` on separate lines.
 
 - **Project:** name, available repository path/key, and all member workspace IDs.
 - **Worktree:** checkout path, branch name, and owning workspace ID.
@@ -192,14 +199,27 @@ ownership record, and dock pin/fold state live under `HERDR_PLUGIN_STATE_DIR`.
 The native publisher and terminal dock each subscribe to Herdr's semantic topology
 and agent-status events. Notifications trigger full `session.snapshot` reads,
 coalesced on a 300ms floor, with a five-second recovery read for missed changes.
-Animations are capped at four frames per second. Native animation patches cached
-title marks without reading a snapshot or running dock reconciliation. Title text
-changes without a subscribed event can take about five seconds to appear.
+Dock animation uses a 300ms interval. Native spinner marks remain static during
+the remote-lag trial to avoid per-frame metadata traffic. Status and title metadata
+still update when their values change. Title changes without a subscribed event
+can take about five seconds to appear.
 The dock animates only working rows in its rendered window, skips unchanged frames,
 and reuses its signature buffers. Idle input polling waits up to 300ms; menus and
 pending synchronization use 50ms. Keyboard input wakes the poll immediately.
 Neither process subscribes to `pane.updated`; focus events do not spawn launchers,
 and metadata writes contain only changed tokens.
+Pane and workspace token values follow Herdr's whitespace, control-character, and
+80-character limits before comparison, so sanitized values do not get republished.
+
+Routine configuration updates reload Herdr only when its native configuration changes.
+Dock-only settings and unchanged `--start` calls do not restart the tab-bar formatter.
+Explicit `--configure` and `--unconfigure` always reload the invoking server,
+since multiple servers can share one configuration file.
+A failed reload leaves `config-reload.pending` in the plugin state directory.
+The next configuration update retries that reload before clearing the marker.
+
+See the [animation transport lesson](#animation-transport-lesson) for the measured
+cost of native metadata animation.
 
 With the dock open, there are two persistent plugin processes per socket: the
 publisher/controller and the dock. Herdr still schedules a short-lived tab-bar
@@ -260,3 +280,62 @@ That late operation can override the dock's requested destination. Each click
 produces at most one activation, delayed if a snapshot refresh is pending; the
 dock does not retry focus. Keyboard Enter avoids this mouse ordering race. Tracked in
 [Herdr #4390](https://github.com/herdrdev/herdr/issues/4390).
+
+## Animation transport lesson
+
+The September 2026 investigation found a transport amplification problem in
+Herdr 0.9.1. Decorative animation belongs in the terminal or client renderer.
+Native metadata represents actual status and title changes, not spinner frames.
+
+The earlier design encoded each native spinner frame in `title_working` metadata.
+Commit `f6f1829` optimized the publisher by caching titles and avoiding a snapshot
+read on each animation tick. Its unit test checked that only changed title tokens
+were sent to a synthetic socket listener. Neither check measured what the real
+Herdr server sent to its clients.
+
+In Herdr 0.9.1, a changed token triggers a
+[complete shell snapshot and agent-view projection](https://github.com/herdrdev/herdr/blob/v0.9.1/src/server/headless/render.rs#L486-L563).
+These use an [unbounded FIFO control queue](https://github.com/herdrdev/herdr/blob/v0.9.1/src/server/client_transport.rs#L250-L357).
+Ordinary terminal rendering uses a separate bounded queue. A one-token API patch
+therefore does not imply a one-cell client update.
+
+An isolated session with eight workspaces, 13 agents, and one working agent
+produced these received client-protocol totals:
+
+| Forty spinner updates | Bytes received | Full shell snapshots |
+| --- | ---: | ---: |
+| Terminal-only spinner | 4,815 | 0 |
+| Native metadata spinner | 675,686 | 40 |
+
+The metadata case also sent 40 agent-view projections. A deliberately paused
+reader retained all 40 obsolete snapshots. Draining at 32 KiB/s delayed observation
+of a health-check reply by 20.5 seconds. This was a controlled slow-reader test,
+not a measurement of the user's connection speed.
+
+The restored dock was then measured separately at 300ms, with a 36×49 viewport.
+In 15 seconds, 50 animation updates produced 3,000 terminal bytes and 9,500
+client-protocol bytes, with no full shell snapshots or metadata writes.
+The static baseline and the animated build with all agents idle produced zero
+terminal or client-protocol bytes after startup settled. All three runs made
+three recovery snapshot requests.
+
+### Reproduction and verification
+
+Use an isolated Herdr session, not the server that hosts active work.
+
+1. Keep the roster, viewport, client capabilities, and working-agent count fixed.
+2. Compare terminal-only animation with `pane.report_metadata` title-token updates.
+   Count received protocol bytes and message types, not just API request sizes.
+3. Compare the actual dock before and after a change, after startup settles.
+   Include an all-idle run and check real status transitions.
+4. Pause a disposable client's reads, generate updates, then resume at a controlled
+   rate. Count obsolete snapshots ahead of a health-check response.
+5. Verify the loaded process and every animation path. The first freeze experiment
+   missed the native timer; freezing the dock signature also left its renderer's
+   tick argument live during unrelated redraws.
+
+`pane.read` returns a serialized screen, not a count of terminal or network bytes.
+Low plugin CPU, fewer API calls, and passing socket-mock tests do not establish
+remote responsiveness. The evidence confirms an amplification mechanism, not that
+every reported freeze had the same cause. Changing cadence scales the cost of an
+update path; it does not repair an expensive update path.

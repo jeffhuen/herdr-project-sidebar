@@ -35,19 +35,16 @@ fn main() -> io::Result<()> {
         Some("--dump-snapshot") => dock::run(),
         Some("--configure") => {
             config::configure()?;
-            reload()?;
             native::start()
         }
         Some("--start") => {
             if config::load()?.enabled {
                 config::update(|_| ())?;
-                reload()?;
             }
             native::start()
         }
         Some("--toggle-style") => {
             config::update(|settings| settings.project_style = !settings.project_style)?;
-            reload()?;
             native::start()?;
             native::refresh()
         }
@@ -55,9 +52,9 @@ fn main() -> io::Result<()> {
         Some("--format-tabbar") => tabbar::format_tabbar(),
         Some("--refresh") => native::refresh(),
         Some("--unconfigure") => {
-            config::unconfigure()?;
-            native::clear()?;
-            reload()
+            let restored = config::unconfigure();
+            let cleared = native::clear();
+            restored.and(cleared)
         }
         Some("--settings") => ipc::call(
             "plugin.pane.open",

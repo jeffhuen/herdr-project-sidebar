@@ -174,18 +174,40 @@ pub fn load() -> io::Result<Settings> {
 }
 
 pub fn update(change: impl FnOnce(&mut Settings)) -> io::Result<Settings> {
-    update_at(&herdr_path(), &settings_path(), &state_dir(), change)
+    update_at(
+        &herdr_path(),
+        &settings_path(),
+        &state_dir(),
+        false,
+        change,
+        crate::reload,
+    )
 }
 
 pub fn configure() -> io::Result<Settings> {
-    update(|settings| {
-        settings.enabled = true;
-        settings.project_style = true;
-    })
+    update_at(
+        &herdr_path(),
+        &settings_path(),
+        &state_dir(),
+        true,
+        |settings| {
+            settings.enabled = true;
+            settings.project_style = true;
+        },
+        crate::reload,
+    )
 }
 
 pub fn unconfigure() -> io::Result<()> {
-    update(|settings| settings.enabled = false).map(|_| ())
+    update_at(
+        &herdr_path(),
+        &settings_path(),
+        &state_dir(),
+        true,
+        |settings| settings.enabled = false,
+        crate::reload,
+    )
+    .map(|_| ())
 }
 
 fn lock(path: &Path) -> io::Result<File> {
@@ -674,7 +696,9 @@ fn update_at(
     native_path: &Path,
     preferences: &Path,
     state: &Path,
+    force_reload: bool,
     change: impl FnOnce(&mut Settings),
+    reload: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<Settings> {
     // Both locks are stable siblings, never the inodes replaced by rename.
     let _preferences_lock = lock(&preferences.with_extension("lock"))?;
@@ -724,8 +748,20 @@ fn update_at(
             &serde_json::to_string_pretty(&ownership).map_err(io::Error::other)?,
         )?;
     }
-    atomic_write(&native_path, &native.to_string())?;
+    let rendered = native.to_string();
+    let pending_reload = state.join("config-reload.pending");
+    if rendered != original || force_reload {
+        // Record before replacing the config so a failed reload is not mistaken
+        // for an applied, unchanged config on the next update.
+        atomic_write(&pending_reload, "")?;
+    }
+    atomic_write(&native_path, &rendered)?;
     atomic_write(preferences, &document.to_string())?;
+    if pending_reload.exists() {
+        reload()
+            .map_err(|error| io::Error::other(format!("Saved; Herdr reload failed: {error}")))?;
+        fs::remove_file(pending_reload)?;
+    }
     if !settings.enabled && journal_path.exists() {
         fs::remove_file(journal_path)?;
     }
@@ -877,6 +913,66 @@ command = "echo keep"
     }
 
     #[test]
+    fn reloads_only_changed_native_config_and_retries_failed_reload() {
+        let root = env::temp_dir().join(format!(
+            "hps-reload-test-{}-{}",
+            std::process::id(),
+            TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let native = root.join("config.toml");
+        let preferences = root.join("plugin/config.toml");
+        let state = root.join("state");
+        let reloads = std::cell::Cell::new(0);
+        let reload = || {
+            reloads.set(reloads.get() + 1);
+            Ok(())
+        };
+        update_at(&native, &preferences, &state, false, |_| {}, reload).unwrap();
+        assert_eq!(reloads.get(), 1);
+        let installed = fs::read_to_string(&native).unwrap();
+        let settings = update_at(
+            &native,
+            &preferences,
+            &state,
+            false,
+            |settings| settings.width = 42,
+            reload,
+        )
+        .unwrap();
+        assert_eq!(settings.width, 42);
+        assert_eq!(fs::read_to_string(&native).unwrap(), installed);
+        update_at(&native, &preferences, &state, false, |_| {}, reload).unwrap();
+        assert_eq!(reloads.get(), 1);
+        assert!(update_at(
+            &native,
+            &preferences,
+            &state,
+            false,
+            |settings| settings.project_style = false,
+            || Err(io::Error::other("reload unavailable")),
+        )
+        .is_err());
+        update_at(&native, &preferences, &state, false, |_| {}, reload).unwrap();
+        assert_eq!(reloads.get(), 2);
+        update_at(&native, &preferences, &state, false, |_| {}, reload).unwrap();
+        assert_eq!(reloads.get(), 2);
+        // Explicit configure applies the shared file to the invoking server.
+        update_at(&native, &preferences, &state, true, |_| {}, reload).unwrap();
+        assert_eq!(reloads.get(), 3);
+        update_at(
+            &native,
+            &preferences,
+            &state,
+            false,
+            |settings| settings.enabled = false,
+            reload,
+        )
+        .unwrap();
+        assert_eq!(reloads.get(), 4);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn malformed_config_and_shortcut_collision_leave_files_unchanged() {
         let root = env::temp_dir().join(format!(
             "hps-config-test-{}-{}",
@@ -892,7 +988,15 @@ command = "echo keep"
             "[keys]\nsettings = 'prefix+comma'\n",
         ] {
             fs::write(&native, input).unwrap();
-            assert!(update_at(&native, &preferences, &state, |_| {}).is_err());
+            assert!(update_at(
+                &native,
+                &preferences,
+                &state,
+                false,
+                |_| {},
+                || { panic!("invalid configuration must not reload Herdr") }
+            )
+            .is_err());
             assert_eq!(fs::read_to_string(&native).unwrap(), input);
             assert!(!preferences.exists());
             assert!(!state.exists());

@@ -5,6 +5,7 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
@@ -391,36 +392,105 @@ impl Menus {
         }
     }
 
-    pub fn draw(&mut self, frame: &mut Frame, theme: &Theme, ready: bool) {
+    pub fn draw(&mut self, frame: &mut Frame, theme: &Theme, ready: bool, anchor_y: Option<u16>) {
+        if anchor_y.is_none() {
+            self.close();
+        }
         let Some(menu) = &mut self.current else {
             return;
         };
         let area = frame.area();
-        let width = area.width.min(42);
-        let height = (menu.fields.len() as u16 + 6).min(area.height.saturating_sub(1));
-        if width < 4 || height < 5 {
-            menu.rect = Rect::default();
-            return;
-        }
-        let rect = Rect::new(
-            menu.anchor.0.min(area.right().saturating_sub(width)),
-            menu.anchor.1.min(area.bottom().saturating_sub(height + 1)),
-            width,
-            height,
-        );
-        menu.rect = rect;
-        menu.shown = height.saturating_sub(5) as usize;
-        menu.offset = super::ensure_visible(menu.selected, menu.offset, menu.shown);
-        frame.render_widget(Clear, rect);
         let title = match menu.target.0 {
             0 => "Project references",
             1 => "Worktree references",
             _ => "Agent references",
         };
+        let text_style = Style::default().fg(theme.idle_fresh);
+        let key_style = Style::default()
+            .fg(theme.working)
+            .add_modifier(Modifier::BOLD);
+        let copy_hint = Line::from(vec![
+            Span::styled("[Enter]", key_style),
+            Span::styled(" Copy", text_style),
+        ]);
+        let close_hint = Line::from(vec![
+            Span::styled("[Esc]", key_style),
+            Span::styled(" Close", text_style),
+        ]);
+        let hint_width = copy_hint.width() + 3 + close_hint.width();
+        let label_width = menu
+            .fields
+            .iter()
+            .map(|field| field.label.len())
+            .max()
+            .unwrap_or(0);
+        let width = (label_width.max(hint_width).max(title.len()) as u16 + 6)
+            .min(area.width.saturating_sub(2));
+        let text_width = width.saturating_sub(6);
+        let footer_height = if usize::from(text_width) < hint_width {
+            2
+        } else {
+            1
+        };
+        let wanted_height = menu.fields.len() as u16 + 6 + footer_height;
+        let bottom = area.bottom().saturating_sub(1);
+        let anchor_y = anchor_y
+            .unwrap()
+            .clamp(area.y, bottom.saturating_sub(1).max(area.y));
+        let above = anchor_y.saturating_sub(area.y);
+        let below = bottom.saturating_sub(anchor_y + 1);
+        let opens_below = below >= wanted_height || below >= above;
+        let height = wanted_height.min(if opens_below { below } else { above });
+        menu.rect = Rect::default();
+        menu.shown = 0;
+        if width < 8 || height < footer_height + 4 {
+            self.close();
+            return;
+        }
+        let rect = Rect::new(
+            menu.anchor.0.clamp(area.x + 1, area.right() - width - 1),
+            if opens_below {
+                anchor_y + 1
+            } else {
+                anchor_y - height
+            },
+            width,
+            height,
+        );
+        let preview_height = if height >= footer_height + 6 { 2 } else { 1 };
+        let preview_gap = u16::from(preview_height == 2);
+        menu.rect = rect;
+        menu.shown = usize::from(height - 2 - footer_height - preview_height - preview_gap);
+        menu.offset = super::ensure_visible(menu.selected, menu.offset, menu.shown);
+        let title_width = usize::from(width - 4)
+            - usize::from(menu.offset > 0)
+            - usize::from(menu.offset + menu.shown <= menu.fields.len());
+        let title = if title.len() > title_width {
+            title.strip_suffix(" references").unwrap_or(title)
+        } else {
+            title
+        };
+        // Titles are fixed ASCII; leave the scroll markers visible even in tiny panes.
+        let title = &title[..title.len().min(title_width)];
+        let mut title = format!(" {title} ");
+        if menu.offset > 0 {
+            title.push('↑');
+        }
+        if menu.offset + menu.shown <= menu.fields.len() {
+            title.push('↓');
+        }
+        for y in area.y..area.bottom() {
+            if y != anchor_y {
+                for x in area.x..area.right() {
+                    frame.buffer_mut()[(x, y)].modifier.insert(Modifier::DIM);
+                }
+            }
+        }
+        frame.render_widget(Clear, rect);
         frame.render_widget(
             Block::default()
                 .borders(Borders::ALL)
-                .title(title)
+                .title(Line::styled(title, text_style))
                 .style(Style::default().bg(Color::Reset))
                 .border_style(Style::default().fg(theme.dim)),
             rect,
@@ -444,7 +514,7 @@ impl Menus {
             frame.render_widget(
                 Paragraph::new(format!("{} {label}", if selected { ">" } else { " " }))
                     .style(style),
-                Rect::new(rect.x + 1, rect.y + 1 + line as u16, width - 2, 1),
+                Rect::new(rect.x + 2, rect.y + 1 + line as u16, width - 4, 1),
             );
         }
         let preview = if !ready {
@@ -458,18 +528,37 @@ impl Menus {
         };
         let preview: String = preview
             .chars()
-            .take(usize::from(width) * 2)
+            .take(usize::from(text_width) * 2)
             .map(|ch| if ch.is_control() { ' ' } else { ch })
             .collect();
         frame.render_widget(
             Paragraph::new(preview)
                 .wrap(Wrap { trim: false })
-                .style(Style::default().fg(theme.dim)),
-            Rect::new(rect.x + 1, rect.bottom() - 4, width - 2, 2),
+                .style(text_style),
+            Rect::new(
+                rect.x + 4,
+                rect.bottom() - 1 - footer_height - preview_height,
+                text_width,
+                preview_height,
+            ),
         );
+        let hints = if footer_height == 1 {
+            let mut line = copy_hint;
+            line.spans
+                .push(Span::styled(" · ", Style::default().fg(theme.dim)));
+            line.spans.extend(close_hint.spans);
+            vec![line]
+        } else {
+            vec![copy_hint, close_hint]
+        };
         frame.render_widget(
-            Paragraph::new("Enter copy · Esc close").style(Style::default().fg(theme.dim)),
-            Rect::new(rect.x + 1, rect.bottom() - 2, width - 2, 1),
+            Paragraph::new(hints),
+            Rect::new(
+                rect.x + 4,
+                rect.bottom() - 1 - footer_height,
+                text_width,
+                footer_height,
+            ),
         );
     }
 
@@ -635,6 +724,170 @@ fn write_clipboard(output: &mut impl Write, text: &str) -> io::Result<()> {
 mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, KeyModifiers};
+
+    #[test]
+    fn menu_preserves_its_source_row_and_mouse_targets_at_viewport_edges() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let projects = super::super::stub();
+        let theme = super::super::load_theme();
+        for (width, height, source_y) in [(36, 24, 1), (80, 24, 21), (24, 18, 8)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut menus = Menus::default();
+            // The row can move after opening, for example after a snapshot refresh.
+            menus.open(&projects, &[Row::Project(0)], 0, (width - 1, 1));
+            let draw = |menus: &mut Menus, terminal: &mut Terminal<TestBackend>| {
+                terminal
+                    .draw(|frame| {
+                        frame.render_widget(
+                            Paragraph::new("source row"),
+                            Rect::new(0, source_y, width, 1),
+                        );
+                        menus.draw(frame, &theme, true, Some(source_y));
+                    })
+                    .unwrap();
+            };
+            draw(&mut menus, &mut terminal);
+            let menu = menus.current.as_ref().unwrap();
+            let rect = menu.rect;
+            assert!(rect.bottom() <= source_y || rect.y > source_y);
+            assert!(rect.x > 0 && rect.right() < width);
+            assert!(rect.bottom() < height, "the dock toolbar must stay visible");
+            let source: String = (0..10)
+                .map(|x| terminal.backend().buffer()[(x, source_y)].symbol())
+                .collect();
+            assert_eq!(source, "source row");
+            for y in 0..height {
+                for x in 0..width {
+                    assert_eq!(
+                        terminal.backend().buffer()[(x, y)]
+                            .modifier
+                            .contains(Modifier::DIM),
+                        y != source_y && !rect.contains((x, y).into()),
+                        "only the menu and its source row should remain undimmed"
+                    );
+                }
+            }
+
+            // Scroll to the final action, then hover the first visible action.
+            menus.input(
+                &Event::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
+                &projects,
+                None,
+                true,
+                &mut io::sink(),
+            );
+            draw(&mut menus, &mut terminal);
+            let menu = menus.current.as_ref().unwrap();
+            let first = menu.offset;
+            let rect = menu.rect;
+            if first > 0 {
+                assert!(
+                    (rect.x..rect.right())
+                        .any(|x| terminal.backend().buffer()[(x, rect.y)].symbol() == "↑"),
+                    "hidden actions need a visible scroll indicator"
+                );
+            }
+            menus.input(
+                &Event::Mouse(crossterm::event::MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    column: rect.x + 4,
+                    row: rect.y + 1,
+                    modifiers: KeyModifiers::NONE,
+                }),
+                &projects,
+                None,
+                true,
+                &mut io::sink(),
+            );
+            assert_eq!(menus.current.as_ref().unwrap().selected, first);
+            draw(&mut menus, &mut terminal);
+            assert!(terminal.backend().buffer()[(rect.x + 4, rect.y + 1)]
+                .modifier
+                .contains(Modifier::REVERSED));
+            menus.input(
+                &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                &projects,
+                None,
+                true,
+                &mut io::sink(),
+            );
+            draw(&mut menus, &mut terminal);
+            assert!(!menus.is_open());
+            assert!(!terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .any(|cell| cell.modifier.contains(Modifier::DIM)));
+        }
+    }
+
+    #[test]
+    fn undrawable_menu_does_not_capture_input() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let projects = super::super::stub();
+        let theme = super::super::load_theme();
+        for (width, height, row) in [(32, 10, 4), (36, 8, 3)] {
+            let mut menus = Menus::default();
+            menus.open(&projects, &[Row::Project(0)], 0, (0, row));
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| menus.draw(frame, &theme, true, Some(row)))
+                .unwrap();
+            assert!(!menus.is_open(), "an invisible menu must not capture input");
+        }
+    }
+
+    #[test]
+    fn short_menu_surfaces_clipboard_write_errors() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        struct RejectCopy;
+        impl Write for RejectCopy {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("clipboard denied"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let socket = std::env::temp_dir().join(format!(
+            "hps-menu-error-{}-{}.sock",
+            std::process::id(),
+            super::super::now_unix_ms()
+        ));
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let session = Session::at(socket.clone()).unwrap();
+        let projects = super::super::stub();
+        let mut menus = Menus::default();
+        menus.open(&projects, &[Row::Project(0)], 0, (0, 6));
+        menus.input(
+            &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &projects,
+            Some(&session),
+            true,
+            &mut RejectCopy,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(32, 14)).unwrap();
+        terminal
+            .draw(|frame| menus.draw(frame, &super::super::load_theme(), true, Some(6)))
+            .unwrap();
+        drop(listener);
+        std::fs::remove_file(socket).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            text.contains("clipboard"),
+            "copy errors must remain visible in short menus"
+        );
+    }
 
     #[test]
     fn menu_repaint_signal_ignores_input_that_changes_nothing() {
