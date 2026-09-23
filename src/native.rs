@@ -13,10 +13,11 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Map, Value};
 
 use crate::activity::{now_unix_ms, ActivityStore, Freshness};
+use crate::git::git_branch;
+use crate::util::{invalid, json_array, open_lock};
 use crate::{config, dock_control, icons, ipc};
 
 const SOURCE: &str = "plugin:herdr-project-sidebar";
-const SPIN_MS: u64 = 250;
 const SETTINGS_POLL: Duration = Duration::from_millis(300);
 const CONTROL_LIMIT: u64 = 8192;
 const START_TIMEOUT: Duration = Duration::from_secs(30);
@@ -44,7 +45,7 @@ const KEYS: [&str; 17] = [
     "ws_group",
 ];
 
-const SPACE_KEYS: [&str; 18] = [
+const SPACE_KEYS: [&str; 22] = [
     "space_blocked",
     "space_done",
     "space_idle",
@@ -63,19 +64,18 @@ const SPACE_KEYS: [&str; 18] = [
     "space_logo_gemini",
     "space_logo_kimi",
     "space_logo_qwen",
+    "space_logo_kiro",
+    "space_logo_cline",
+    "space_logo_kilo",
+    "space_logo_other",
 ];
+const BRAND_VENDORS: [&str; 7] = ["claude", "gemini", "kimi", "qwen", "kiro", "cline", "kilo"];
 
 type Tokens = Map<String, Value>;
 type RowTokens = BTreeMap<String, Tokens>;
 
-fn socket_path() -> io::Result<PathBuf> {
-    std::env::var_os("HERDR_SOCKET_PATH")
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HERDR_SOCKET_PATH is not set"))
-}
-
 fn daemon_paths() -> io::Result<(PathBuf, PathBuf)> {
-    let hash = ipc::socket_hash(&socket_path()?);
+    let hash = ipc::socket_hash(&ipc::socket_path()?);
     let dir = config::state_dir();
     fs::DirBuilder::new()
         .recursive(true)
@@ -228,12 +228,7 @@ pub fn dock_command(command: dock_control::Command, session: &ipc::Session) -> i
                 Some(
                     current["pane"]["tab_id"]
                         .as_str()
-                        .ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "pane.current omitted tab_id",
-                            )
-                        })?
+                        .ok_or_else(|| invalid("pane.current omitted tab_id"))?
                         .to_owned(),
                 )
             }
@@ -261,10 +256,7 @@ pub fn dock_command(command: dock_control::Command, session: &ipc::Session) -> i
     let mut line = String::new();
     BufReader::new(stream.take(CONTROL_LIMIT)).read_line(&mut line)?;
     if !line.ends_with('\n') {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "truncated dock command reply",
-        ));
+        return Err(invalid("truncated dock command reply"));
     }
     let reply: Value = serde_json::from_str(&line)?;
     if reply["ok"] == true {
@@ -292,10 +284,7 @@ fn handle_command(
             return Ok(None);
         } // Readiness probe.
         if !line.ends_with('\n') {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "truncated dock command",
-            ));
+            return Err(invalid("truncated dock command"));
         }
         let request: DockRequest = serde_json::from_str(&line)?;
         controller.command(
@@ -339,12 +328,7 @@ pub fn run() -> io::Result<()> {
 
 fn run_inner() -> io::Result<()> {
     let (lock_path, ready_path) = daemon_paths()?;
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(lock_path)?;
+    let lock = open_lock(&lock_path)?;
     match lock.try_lock() {
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => {
@@ -378,8 +362,6 @@ fn run_inner() -> io::Result<()> {
     let mut sync = ipc::SnapshotSync::new();
     let mut settings = config::load()?;
     let mut settings_at = Instant::now();
-    let mut animation_session = None;
-    let mut animation_at = Instant::now();
     let mut plugin_check_at = Instant::now();
     let mut lost_at: Option<Instant> = None;
     let mut last_refresh_error: Option<String> = None;
@@ -431,7 +413,6 @@ fn run_inner() -> io::Result<()> {
         let refreshed = match sync.poll() {
             Ok(Some(snapshot)) => Some((|| {
                 lost_at = None;
-                animation_session = None;
                 if plugin_check_at.elapsed() >= Duration::from_secs(5) {
                     plugin_check_at = Instant::now();
                     let registry = snapshot.session.call("plugin.list", json!({}))?;
@@ -450,31 +431,10 @@ fn run_inner() -> io::Result<()> {
                         unconfigured?;
                     }
                 }
-                let result = refresh_daemon(&mut publisher, &mut controller, &snapshot, &settings);
-                if result.is_ok() {
-                    animation_session = Some(snapshot.session);
-                    animation_at = Instant::now();
-                }
-                result
+                refresh_daemon(&mut publisher, &mut controller, &snapshot, &settings)
             })()),
             Ok(None) => None,
-            Err(error) => {
-                animation_session = None;
-                Some(Err(error))
-            }
-        };
-        let refreshed = if refreshed.is_none()
-            && !sync.is_stale()
-            && animation_at.elapsed() >= Duration::from_millis(SPIN_MS)
-        {
-            animation_at = Instant::now();
-            animation_session.as_ref().map(|session| {
-                // EXPERIMENT (remote-lag): freeze timer updates as well as snapshots.
-                // publisher.animate(session, (now_unix_ms() / SPIN_MS) as usize).map(|_| true)
-                publisher.animate(session, 0).map(|_| true)
-            })
-        } else {
-            refreshed
+            Err(error) => Some(Err(error)),
         };
         publication.unlock()?;
         if let Some(refreshed) = refreshed {
@@ -530,19 +490,6 @@ fn refresh_daemon(
     reconciled?;
     published?;
     Ok(settings.enabled)
-}
-
-fn entries<'a>(snapshot: &'a Value, key: &str) -> io::Result<&'a [Value]> {
-    snapshot
-        .get(key)
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("session.snapshot omitted {key}"),
-            )
-        })
 }
 
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
@@ -621,14 +568,8 @@ fn patch_workspace(session: &ipc::Session, workspace: &str, tokens: Tokens) -> i
 
 fn publication_lock() -> io::Result<fs::File> {
     let directory = config::state_dir();
-    fs::create_dir_all(&directory)?;
-    let hash = ipc::socket_hash(&socket_path()?);
-    OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(directory.join(format!("p-{hash:016x}.lock")))
+    let hash = ipc::socket_hash(&ipc::socket_path()?);
+    open_lock(&directory.join(format!("p-{hash:016x}.lock")))
 }
 
 pub fn refresh() -> io::Result<()> {
@@ -645,12 +586,7 @@ pub fn clear() -> io::Result<()> {
     // Use the controller only when no daemon owns it; keep daemon -> publication
     // lock order identical to run_inner so cleanup cannot race a live owner.
     let (lock_path, ready_path) = daemon_paths()?;
-    let daemon = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(lock_path)?;
+    let daemon = open_lock(&lock_path)?;
     let own_controller = match daemon.try_lock() {
         Ok(()) => true,
         Err(std::fs::TryLockError::WouldBlock) => false,
@@ -673,8 +609,8 @@ pub fn clear() -> io::Result<()> {
 fn clear_snapshot(snapshot: &ipc::Snapshot) -> io::Result<()> {
     let session = &snapshot.session;
     session.check()?;
-    let panes = entries(&snapshot.data, "panes")?;
-    let workspaces = entries(&snapshot.data, "workspaces")?;
+    let panes = json_array(&snapshot.data, "panes")?;
+    let workspaces = json_array(&snapshot.data, "workspaces")?;
     let mut failure = None;
     for pane in panes {
         if KEYS.iter().any(|key| pane["tokens"].get(*key).is_some()) {
@@ -708,7 +644,6 @@ fn clear_snapshot(snapshot: &ipc::Snapshot) -> io::Result<()> {
 
 pub struct Publisher {
     pub activity: ActivityStore,
-    animated: BTreeMap<String, (&'static str, String)>,
     grouped: Option<bool>,
     native_style: bool,
 }
@@ -717,7 +652,6 @@ impl Default for Publisher {
     fn default() -> Self {
         Self {
             activity: ActivityStore::new(config::state_dir()),
-            animated: BTreeMap::new(),
             grouped: None,
             native_style: false,
         }
@@ -725,49 +659,21 @@ impl Default for Publisher {
 }
 
 impl Publisher {
-    fn animate(&mut self, session: &ipc::Session, step: usize) -> io::Result<()> {
-        for (pane, (key, title)) in &mut self.animated {
-            let (previous, text) = title
-                .split_once(' ')
-                .ok_or_else(|| io::Error::other("invalid animated title"))?;
-            let mark = if *key == "title_working" {
-                icons::spinner(step)
-            } else {
-                icons::blocked_mark(step)
-            };
-            if mark == previous {
-                continue;
-            }
-            let next = format!("{mark} {text}");
-            patch(
-                session,
-                pane,
-                Map::from_iter([((*key).to_owned(), json!(next))]),
-            )?;
-            *title = next;
-        }
-        Ok(())
-    }
-
     pub fn refresh(
         &mut self,
         snapshot: &ipc::Snapshot,
         settings: &config::Settings,
     ) -> io::Result<()> {
         let session = &snapshot.session;
-        self.animated.clear();
-        let agents = entries(&snapshot.data, "agents")?;
-        let workspaces = entries(&snapshot.data, "workspaces")?;
-        let tabs = entries(&snapshot.data, "tabs")?;
-        let panes = entries(&snapshot.data, "panes")?;
+        let agents = json_array(&snapshot.data, "agents")?;
+        let workspaces = json_array(&snapshot.data, "workspaces")?;
+        let tabs = json_array(&snapshot.data, "tabs")?;
+        let panes = json_array(&snapshot.data, "panes")?;
         if agents
             .iter()
             .any(|agent| text(agent, "terminal_id").is_empty())
         {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "snapshot agent is missing terminal_id",
-            ));
+            return Err(invalid("snapshot agent is missing terminal_id"));
         }
         if self.activity.sync_session(session)? {
             self.grouped = None;
@@ -799,11 +705,6 @@ impl Publisher {
         }
         self.native_style = false;
 
-        // EXPERIMENT (remote-lag): static spinner mark; revert to the line below.
-        let spin_step = 0;
-        // let spin_step = (now_ms / SPIN_MS) as usize;
-
-        // 2. Generate row tokens
         let (wanted, wanted_workspaces) = rows(&RowsInput {
             agents,
             workspaces,
@@ -812,12 +713,10 @@ impl Publisher {
             settings,
             activity: &self.activity,
             now_ms,
-            spin_step,
         });
 
-        // 3. Patch panes with chunked writes. Deltas compare against the live
-        // snapshot tokens, never a private cache: external writes must not
-        // leave stale beliefs installed.
+        // Deltas compare against live snapshot tokens, never a private cache:
+        // external writes must not leave stale beliefs installed.
         for pane in panes {
             let id = text(pane, "pane_id");
             if !wanted.contains_key(id) && KEYS.iter().any(|key| pane["tokens"].get(*key).is_some())
@@ -826,17 +725,11 @@ impl Publisher {
             }
         }
         for (pane, mut tokens) in wanted {
-            for key in ["title_working", "title_blocked"] {
-                if let Some(title) = tokens[key].as_str() {
-                    self.animated.insert(pane.clone(), (key, title.to_owned()));
-                }
-            }
             let live = panes.iter().find(|p| text(p, "pane_id") == pane);
             retain_delta(&mut tokens, live.map(|p| &p["tokens"]));
             patch(session, &pane, tokens)?;
         }
 
-        // 4. Patch workspaces (same live-token rule as panes).
         for (workspace, mut tokens) in wanted_workspaces {
             let live = workspaces
                 .iter()
@@ -845,7 +738,6 @@ impl Publisher {
             patch_workspace(session, &workspace, tokens)?;
         }
 
-        // 5. Update sort override
         if self.grouped != Some(settings.grouped) {
             let sort = if settings.grouped {
                 json!([{"field": {"token": "ws_group"}, "order": "asc"}, {"field": "state_change_seq", "order": "desc"}, {"field": "tab_order", "order": "asc"}, {"field": "pane_order", "order": "asc"}])
@@ -881,7 +773,6 @@ pub struct RowsInput<'a> {
     pub settings: &'a config::Settings,
     pub activity: &'a ActivityStore,
     pub now_ms: u64,
-    pub spin_step: usize,
 }
 
 pub fn rows(input: &RowsInput) -> (RowTokens, RowTokens) {
@@ -893,7 +784,6 @@ pub fn rows(input: &RowsInput) -> (RowTokens, RowTokens) {
         settings,
         activity,
         now_ms,
-        spin_step,
     } = *input;
     let mut cwd = HashMap::new();
     let mut ws_agents: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
@@ -975,7 +865,6 @@ pub fn rows(input: &RowsInput) -> (RowTokens, RowTokens) {
         });
     }
 
-    // Build workspace tokens
     let mut workspace_rows = BTreeMap::new();
     for ws in workspaces {
         let ws_id = text(ws, "workspace_id");
@@ -996,12 +885,8 @@ pub fn rows(input: &RowsInput) -> (RowTokens, RowTokens) {
 
         let mark_token = match chosen {
             "blocked" => "space_blocked".into(),
-            "working" => match vendor {
-                "claude" | "gemini" | "kimi" | "qwen" | "kiro" | "cline" | "kilo" => {
-                    format!("space_working_{vendor}")
-                }
-                _ => "space_working_other".into(),
-            },
+            "working" if BRAND_VENDORS.contains(&vendor) => format!("space_working_{vendor}"),
+            "working" => "space_working_other".into(),
             "done" => "space_done".into(),
             "idle" => "space_idle".into(),
             "unknown" => "space_unknown".into(),
@@ -1010,15 +895,13 @@ pub fn rows(input: &RowsInput) -> (RowTokens, RowTokens) {
         tokens.insert(mark_token, json!(icons::state_mark(chosen)));
         tokens.insert("space_label".into(), json!(label));
 
-        // Space logos
         let mut seen_logos = HashSet::new();
         for &(v, _) in members {
             if seen_logos.insert(v) {
-                let logo_key = match v {
-                    "claude" | "gemini" | "kimi" | "qwen" | "kiro" | "cline" | "kilo" => {
-                        format!("space_logo_{v}")
-                    }
-                    _ => "space_logo_other".into(),
+                let logo_key = if BRAND_VENDORS.contains(&v) {
+                    format!("space_logo_{v}")
+                } else {
+                    "space_logo_other".into()
                 };
                 let glyph = icons::logo(v, settings.icons).unwrap_or("");
                 let text = if glyph.is_empty() {
@@ -1032,7 +915,6 @@ pub fn rows(input: &RowsInput) -> (RowTokens, RowTokens) {
         workspace_rows.insert(ws_id.to_owned(), tokens);
     }
 
-    // Agent ordering
     let tab_order: HashMap<_, _> = tabs
         .iter()
         .enumerate()
@@ -1107,24 +989,21 @@ pub fn rows(input: &RowsInput) -> (RowTokens, RowTokens) {
         let status = text(agent, "agent_status");
         let mut tokens = empty_tokens(&KEYS);
 
-        // Resolve display state
-        let display = if status == "working" {
-            "working"
-        } else if status == "blocked" {
-            "blocked"
-        } else if status == "done" {
-            "done"
-        } else if status == "idle" {
-            match activity.freshness(text(agent, "terminal_id"), now_ms) {
-                Freshness::Fresh => "idle_fresh",
-                Freshness::Stale => "idle_stale",
-                Freshness::Normal => "idle",
-            }
-        } else {
-            status
+        let (logo_token, title_mark, title_token) = match status {
+            "working" => ("logo_working", icons::spinner(0), "title_working"),
+            "blocked" => ("logo", icons::blocked_mark(0), "title_blocked"),
+            "done" => ("logo", "✓", "title_done"),
+            "idle" => match activity.freshness(text(agent, "terminal_id"), now_ms) {
+                Freshness::Fresh => ("logo", "", "title_idle_fresh"),
+                Freshness::Stale => ("logo_stale", "", "title_idle_stale"),
+                Freshness::Normal => ("logo", "", "title_idle"),
+            },
+            "idle_fresh" => ("logo", "", "title_idle_fresh"),
+            "idle_stale" => ("logo_stale", "", "title_idle_stale"),
+            "unknown" => ("logo", "◌", "title_unknown"),
+            _ => ("logo", "", "title_unknown"),
         };
 
-        // Group header
         let is_head = seen_groups.insert(&ws.group);
         if settings.grouped {
             if is_head {
@@ -1143,7 +1022,6 @@ pub fn rows(input: &RowsInput) -> (RowTokens, RowTokens) {
             }
         }
 
-        // Indent & Logo
         let indent = if settings.grouped && !is_head {
             "\u{200b}  "
         } else {
@@ -1156,37 +1034,17 @@ pub fn rows(input: &RowsInput) -> (RowTokens, RowTokens) {
         }
         if settings.icons != config::IconMode::None {
             let logo_str = format!("{indent}{}", logo_glyph.unwrap_or(vendor));
-            match display {
-                "working" => tokens.insert("logo_working".into(), json!(logo_str)),
-                "idle_stale" => tokens.insert("logo_stale".into(), json!(logo_str)),
-                _ => tokens.insert("logo".into(), json!(logo_str)),
-            };
+            tokens.insert(logo_token.into(), json!(logo_str));
         }
 
-        // Title with animated lead
         let raw_title = agent_title(agent, settings.show_title);
-        let title_prefix = match display {
-            "working" => format!("{} ", icons::spinner(spin_step)),
-            "blocked" => format!("{} ", icons::blocked_mark(spin_step)),
-            "done" => "✓ ".into(),
-            "unknown" => "◌ ".into(),
-            _ => "".into(),
-        };
+        let separator = if title_mark.is_empty() { "" } else { " " };
         let full_title = if settings.grouped {
-            format!("{title_prefix}{raw_title}")
+            format!("{title_mark}{separator}{raw_title}")
         } else {
-            format!("{title_prefix}{} · {raw_title}", ws.label)
+            format!("{title_mark}{separator}{} · {raw_title}", ws.label)
         };
 
-        let title_token = match display {
-            "working" => "title_working",
-            "done" => "title_done",
-            "blocked" => "title_blocked",
-            "idle_fresh" => "title_idle_fresh",
-            "idle_stale" => "title_idle_stale",
-            "idle" => "title_idle",
-            _ => "title_unknown",
-        };
         tokens.insert(title_token.into(), json!(full_title));
 
         // Group token for the declarative native sort (recency itself is
@@ -1212,46 +1070,12 @@ fn agent_title(agent: &Value, show_title: bool) -> &str {
     if title.is_empty() {
         return name;
     }
-    let title = if matches!(name, "omp" | "pi") {
-        title
-            .strip_prefix("π ")
-            .unwrap_or(title)
-            .trim_start_matches(|ch: char| {
-                ch.is_whitespace() || ch == '>' || ('\u{2800}'..='\u{28ff}').contains(&ch)
-            })
-    } else {
-        title
-    };
+    let title = icons::clean_agent_title(name, title, false);
     if title.is_empty() {
         name
     } else {
         title
     }
-}
-
-pub fn git_branch(start: &Path) -> Option<String> {
-    if !start.is_absolute() {
-        return None;
-    }
-    for dir in start.ancestors() {
-        let marker = dir.join(".git");
-        let git = if marker.is_dir() {
-            marker
-        } else if marker.is_file() {
-            let contents = fs::read_to_string(marker).ok()?;
-            dir.join(contents.trim().strip_prefix("gitdir:")?.trim())
-        } else {
-            continue;
-        };
-        let head = fs::read_to_string(git.join("HEAD")).ok()?;
-        let head = head.trim();
-        if let Some(branch) = head.strip_prefix("ref: refs/heads/") {
-            return Some(branch.to_owned());
-        }
-        return (head.len() >= 7 && head.bytes().all(|byte| byte.is_ascii_hexdigit()))
-            .then(|| head[..7].to_owned());
-    }
-    None
 }
 
 #[cfg(test)]
@@ -1281,7 +1105,6 @@ mod tests {
             settings: &settings,
             activity: &ActivityStore::default(),
             now_ms: 0,
-            spin_step: 0,
         });
 
         assert_eq!(panes["a-new"]["gap"], Value::Null);
@@ -1346,89 +1169,38 @@ mod tests {
     }
 
     #[test]
-    fn animation_patches_only_changed_titles_without_fetching_snapshots() {
-        let socket =
-            std::env::temp_dir().join(format!("hps-animation-{}.sock", std::process::id()));
-        let listener = UnixListener::bind(&socket).unwrap();
-        let _socket_file = SocketFile(socket.clone());
-        listener.set_nonblocking(true).unwrap();
-        let session = ipc::Session::at(socket).unwrap();
-        let server = thread::spawn(move || {
-            let mut requests = Vec::new();
-            let deadline = Instant::now() + Duration::from_secs(3);
-            while Instant::now() < deadline && requests.len() < 3 {
-                let (mut stream, _) = match listener.accept() {
-                    Ok(connection) => connection,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(1));
-                        continue;
-                    }
-                    Err(error) => panic!("{error}"),
-                };
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(1)))
-                    .unwrap();
-                let mut line = String::new();
-                BufReader::new(&mut stream).read_line(&mut line).unwrap();
-                let request: Value = serde_json::from_str(&line).unwrap();
-                writeln!(stream, "{}", json!({"id":request["id"],"result":{}})).unwrap();
-                requests.push(request);
-            }
-            requests
+    fn workspace_logos_are_cleared_when_agents_leave() {
+        let agents = ["kiro", "cline", "kilo", "omp"].map(|vendor| {
+            json!({"workspace_id": "w", "agent": vendor, "agent_status": "idle"})
         });
-        let mut publisher = Publisher::default();
-        publisher.animated.insert(
-            "working".into(),
-            ("title_working", format!("{} build", icons::spinner(0))),
-        );
-        publisher
-            .animated
-            .insert("blocked".into(), ("title_blocked", "? approval".into()));
-        publisher.animate(&session, 0).unwrap();
-        publisher.animate(&session, 1).unwrap();
-        publisher.animate(&session, 3).unwrap();
-        let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 3);
-        assert!(requests
-            .iter()
-            .all(|request| request["method"] == "pane.report_metadata"));
-        assert!(requests.iter().all(|request| request["params"]["tokens"]
-            .as_object()
-            .unwrap()
-            .len()
-            == 1));
-        assert_eq!(
-            requests
-                .iter()
-                .filter(|request| request["params"]["pane_id"] == "blocked")
-                .count(),
-            1
-        );
-        assert_eq!(publisher.animated["blocked"].1, "· approval");
-        assert_eq!(
-            publisher.animated["working"].1,
-            format!("{} build", icons::spinner(3))
-        );
+        let workspaces = [json!({"workspace_id": "w", "label": "demo"})];
+        let settings = config::Settings {
+            show_branch: false,
+            ..config::Settings::default()
+        };
+        let activity = ActivityStore::default();
+        let render = |agents: &[Value]| {
+            rows(&RowsInput {
+                agents,
+                workspaces: &workspaces,
+                tabs: &[],
+                panes: &[],
+                settings: &settings,
+                activity: &activity,
+                now_ms: 0,
+            }).1.remove("w").unwrap()
+        };
+        let live = json!(render(&agents));
+        let mut tokens = render(&[]);
+        retain_delta(&mut tokens, Some(&live));
+        assert_eq!(json!(tokens), json!({
+            "space_logo_kiro": null,
+            "space_logo_cline": null,
+            "space_logo_kilo": null,
+            "space_logo_other": null,
+        }));
     }
 
-    #[test]
-    fn branch_lookup_handles_relative_gitdirs_and_detached_heads() {
-        let root = std::env::temp_dir().join(format!("hps-head-{}", std::process::id()));
-        fs::create_dir_all(root.join("checkout/nested")).unwrap();
-        fs::create_dir_all(root.join("git")).unwrap();
-        fs::write(root.join("checkout/.git"), "gitdir: ../git\n").unwrap();
-        fs::write(root.join("git/HEAD"), "ref: refs/heads/topic/branch\n").unwrap();
-        assert_eq!(
-            git_branch(&root.join("checkout/nested")).as_deref(),
-            Some("topic/branch")
-        );
-        fs::write(root.join("git/HEAD"), "abcdef0123456789\n").unwrap();
-        assert_eq!(
-            git_branch(&root.join("checkout/nested")).as_deref(),
-            Some("abcdef0")
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
 
     #[test]
     fn test_done_follows_authoritative_status() {
@@ -1448,7 +1220,6 @@ mod tests {
             settings: &settings,
             activity: &activity,
             now_ms: 1000,
-            spin_step: 0,
         });
         // No hold: idle renders idle even with no focus event since done.
         assert!(panes["p1"]["title_idle"].is_string());
@@ -1477,7 +1248,6 @@ mod tests {
                 settings: &settings,
                 activity: &activity,
                 now_ms: 2_000,
-                spin_step: 0,
             })
             .0
         };

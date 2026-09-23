@@ -8,12 +8,12 @@ These are separate presentation implementations, not interchangeable skins.
 Both use Herdr's agent and workspace state. The dock uses native APIs for
 navigation and pane placement; native-sidebar styling does not control it.
 
-## Install v0.2.0
+## Install v0.2.2
 
 Requires Herdr 0.9.1+, Rust 1.89+, Git, and Linux or macOS.
 
 ```sh
-herdr plugin install jeffhuen/herdr-project-sidebar --ref v0.2.0
+herdr plugin install jeffhuen/herdr-project-sidebar --ref v0.2.2
 herdr plugin action invoke configure --plugin herdr-project-sidebar
 ```
 
@@ -24,7 +24,7 @@ This release was verified on Linux; macOS runtime behavior was not checked.
 ## Build and link a checkout
 
 ```sh
-git clone --branch v0.2.0 --depth 1 https://github.com/jeffhuen/herdr-project-sidebar.git
+git clone --branch v0.2.2 --depth 1 https://github.com/jeffhuen/herdr-project-sidebar.git
 cd herdr-project-sidebar
 cargo build --release --locked
 cargo test --release --locked
@@ -53,11 +53,14 @@ controller and dock without restarting Herdr or closing agent panes.
   Toggle actions retain their originating tab even if the invoking dock pane
   closes before the action runs.
 - In the dock, `j/k` or arrows browse, `Enter` activates, and `h/l` fold/unfold.
-  Browsing does not snap back after a timeout. Click anywhere on a project or
-  worktree row to fold or unfold it. `Enter` navigates without changing its fold.
-  Click an agent row to activate it. `v` switches the saved order, `p` pins, `/` filters,
-  `[`/`]` change width, and `q` closes.
-  Agent counts and **Settings** appear in the bottom bar. The settings popup opens above it.
+  Browsing does not snap back after a timeout. Click a project header, or the
+  fold marker of a worktree row, to fold or unfold it. Click a worktree name to
+  open its workspace, or an agent row to open its session. `Enter` navigates
+  without changing folds. `N` or **[+ New]** creates a workspace and focuses its
+  terminal. `D` asks to close the selected row's workspace. `v` switches the saved
+  order, `p` pins, `/` filters, `[`/`]` change width, and `q` closes.
+  The bottom bar shows agent counts above **[+ New]** and **Settings**. The
+  settings popup opens above it.
 - `prefix+p` switches between Projects styling and your previous Herdr rows.
   It changes both the row layout and the sort override, without moving focus,
   closing the sidebar, or creating panes. This replaces the default previous-tab
@@ -75,18 +78,37 @@ Herdr 0.9.1 does not expose plugin actions in its mouse menus, so settings must
 be opened by shortcut or CLI. Once open, every control supports the mouse.
 Herdr's native sidebar stays on the left. The terminal dock supports either side.
 
-### Copy references (Unreleased)
+The dock reads its colors from Herdr's `config.toml`: `HERDR_CONFIG_PATH`, then
+`$XDG_CONFIG_HOME/herdr/config.toml`, then `~/.config/herdr/config.toml`.
+Menus, dialogs, and the footer buttons use `[ui] accent`.
+
+### Row menus
 
 In the terminal dock, right-click a row or press `m` on a browsed row.
 The dock enables Herdr's per-pane right-click forwarding when it starts.
-Use arrows or `j/k`, then `Enter`, or click an action. `Esc` or an outside click
-closes the menu without activating a row or changing which groups are folded.
+Use arrows or `j/k`, then `Enter`, or click an item. `Esc`, a click outside the
+menu, or a click in another pane closes the menu without activating a row or
+changing which groups are folded.
+
+Workspace actions appear above the copy references:
+
+- **Linked worktree:** **Rename**, **Close**, and **Delete worktree checkout...**.
+- **Main checkout:** **Rename**, **Close**, **New worktree**, and **Open worktree...**.
+- **Project header:** **New worktree** and **Open worktree...**. **Rename** and
+  **Close** appear only when the project has one workspace.
+
+**Close** and **Delete worktree checkout...** ask for confirmation. Delete does
+not force the removal of a checkout that has changes. Dialogs accept the keyboard
+and the mouse. `Enter` or the confirm button submits, `^c` clears the input, and
+`Esc`, the `esc cancel` hint, or a click outside the dialog cancels.
 
 The menu dims the surrounding dock and keeps the source row at normal brightness.
 It opens below that row, or above it near the bottom of the dock.
 Its width follows the action labels and keyboard hints.
-Previews wrap at the same indent as the labels. Narrow docks put `[Enter] Copy`
+Previews wrap at the same indent as the labels. Narrow docks put `[Enter] Select`
 and `[Esc] Close` on separate lines.
+
+The copy references are:
 
 - **Project:** name, available repository path/key, and all member workspace IDs.
 - **Worktree:** checkout path, branch name, and owning workspace ID.

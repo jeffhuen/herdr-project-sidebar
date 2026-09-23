@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-09-23
+
+Internal cleanup for maintainability. Smaller modules and shared helpers replace
+duplicated code, with about 800 fewer lines. Behavior changes only as listed below.
+
+### Changed
+
+- `D` opens the Close dialog, like **Close** in the row menu. On a project header
+  that covers several workspaces, `D` shows a hint instead.
+- Menus and dialogs close when the dock loses focus, for example after a click in
+  another pane.
+- The dock and the settings popup share one settings view.
+
+### Fixed
+
+- The dock reads its theme from Herdr's config file: `HERDR_CONFIG_PATH`, then
+  `$XDG_CONFIG_HOME/herdr/config.toml`, then `~/.config/herdr/config.toml`.
+- Space logos for kiro, cline, kilo, and other agents clear when those agents
+  leave a workspace or the plugin is unconfigured.
+- A click on a worktree row's fold marker folds the row. Before, it opened the
+  workspace.
+
+### Removed
+
+- The undocumented `--dump-snapshot` flag.
+- The native spinner timer. Native status marks were already static.
+
 ## [0.2.1] - 2026-09-23
 
 ### Added
@@ -141,6 +168,7 @@ First tagged release. Earlier development builds were available from `main`.
 - Herdr 0.9.1 can override a mouse activation with a late pane-focus operation.
   Keyboard Enter avoids this race. See [Herdr #4390](https://github.com/herdrdev/herdr/issues/4390).
 
-[Unreleased]: https://github.com/jeffhuen/herdr-project-sidebar/compare/v0.2.1...main
+[Unreleased]: https://github.com/jeffhuen/herdr-project-sidebar/compare/v0.2.2...main
+[0.2.2]: https://github.com/jeffhuen/herdr-project-sidebar/releases/tag/v0.2.2
 [0.2.1]: https://github.com/jeffhuen/herdr-project-sidebar/releases/tag/v0.2.1
 [0.2.0]: https://github.com/jeffhuen/herdr-project-sidebar/releases/tag/v0.2.0

@@ -1,4 +1,4 @@
-//! Copy-only row menus. Clipboard writes use Herdr's OSC 52 forwarding.
+//! Row menus with workspace actions and copy references; clipboard writes use OSC 52.
 use super::{row_key, AgentSession, Project, Row, Theme};
 use crate::ipc::Session;
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
@@ -14,6 +14,11 @@ use std::{
     io::{self, Write},
     thread::JoinHandle,
 };
+
+mod dialog;
+use dialog::Dialog;
+
+const POPUP_BG: Color = Color::Rgb(0x18, 0x18, 0x25);
 
 #[derive(Clone, PartialEq)]
 struct Field {
@@ -59,41 +64,6 @@ impl MenuItem {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub(super) enum Dialog {
-    Rename {
-        workspace_id: String,
-        input: String,
-    },
-    ConfirmCloseWorkspace {
-        workspace_id: String,
-        name: String,
-    },
-    ConfirmDeleteWorktree {
-        workspace_id: String,
-        name: String,
-    },
-    NewWorktree {
-        workspace_id: String,
-        input: String,
-    },
-    OpenWorktree {
-        workspace_id: String,
-        input: String,
-    },
-}
-
-impl Dialog {
-    /// The editable text of prompt dialogs; confirmations have none.
-    fn input_mut(&mut self) -> Option<&mut String> {
-        match self {
-            Dialog::Rename { input, .. }
-            | Dialog::NewWorktree { input, .. }
-            | Dialog::OpenWorktree { input, .. } => Some(input),
-            Dialog::ConfirmCloseWorkspace { .. } | Dialog::ConfirmDeleteWorktree { .. } => None,
-        }
-    }
-}
 
 #[derive(Default)]
 pub(super) struct Menus {
@@ -270,111 +240,86 @@ fn fields(projects: &[Project], row: Row) -> (Vec<Field>, Option<String>) {
     (fields, lookup)
 }
 fn build_items(row: Row, projects: &[Project], fields: &[Field]) -> Vec<MenuItem> {
-    let mut items = Vec::new();
-    match row {
+    let (single_workspace, worktree_actions) = match row {
         Row::Worktree(pi, wi) => {
             let worktree = &projects[pi].worktrees[wi];
             let is_linked = worktree.depth > 0
                 || (!worktree.repo_root.is_empty() && worktree.path != worktree.repo_root);
-            items.push(MenuItem::Action {
-                id: "rename",
-                label: "Rename",
-                desc: "Rename workspace label",
-            });
-            items.push(MenuItem::Action {
-                id: "close",
-                label: "Close",
-                desc: "Close workspace",
-            });
-            if is_linked {
-                items.push(MenuItem::Action {
-                    id: "delete_worktree",
-                    label: "Delete worktree checkout...",
-                    desc: "Remove worktree and delete directory",
-                });
-            } else {
-                items.push(MenuItem::Action {
-                    id: "new_worktree",
-                    label: "New worktree",
-                    desc: "Create and open new git worktree",
-                });
-                items.push(MenuItem::Action {
-                    id: "open_worktree",
-                    label: "Open worktree...",
-                    desc: "Open existing git worktree",
-                });
-            }
-            items.push(MenuItem::Separator);
-            items.push(MenuItem::Copy {
-                field_idx: None,
-                label: "Copy reference".into(),
-            });
-            for (i, f) in fields.iter().enumerate() {
-                items.push(MenuItem::Copy {
-                    field_idx: Some(i),
-                    label: f.label.to_owned(),
-                });
-            }
+            (true, Some(is_linked))
         }
         Row::Project(pi) => {
-            let project = &projects[pi];
-            if !project.workspaces.is_empty() {
-                // A repo header can stand for several workspaces. Rename and
-                // Close must target exactly one, so a multi-workspace header
-                // leaves them to its worktree rows.
-                if project.workspaces.len() == 1 {
-                    items.push(MenuItem::Action {
-                        id: "rename",
-                        label: "Rename",
-                        desc: "Rename workspace label",
-                    });
-                    items.push(MenuItem::Action {
-                        id: "close",
-                        label: "Close",
-                        desc: "Close workspace",
-                    });
-                }
-                items.push(MenuItem::Action {
-                    id: "new_worktree",
-                    label: "New worktree",
-                    desc: "Create and open new git worktree",
-                });
-                items.push(MenuItem::Action {
-                    id: "open_worktree",
-                    label: "Open worktree...",
-                    desc: "Open existing git worktree",
-                });
-                items.push(MenuItem::Separator);
-            }
-            items.push(MenuItem::Copy {
-                field_idx: None,
-                label: "Copy reference".into(),
-            });
-            for (i, f) in fields.iter().enumerate() {
-                items.push(MenuItem::Copy {
-                    field_idx: Some(i),
-                    label: f.label.to_owned(),
-                });
-            }
+            let workspaces = &projects[pi].workspaces;
+            // Rename and Close must target exactly one workspace.
+            (workspaces.len() == 1, (!workspaces.is_empty()).then_some(false))
         }
-        Row::Agent(_, _, _) => {
-            items.push(MenuItem::Copy {
-                field_idx: None,
-                label: "Copy reference".into(),
+        Row::Agent(_, _, _) => (false, None),
+    };
+    let mut items = Vec::new();
+    if single_workspace {
+        items.push(MenuItem::Action {
+            id: "rename",
+            label: "Rename",
+            desc: "Rename workspace label",
+        });
+        items.push(MenuItem::Action {
+            id: "close",
+            label: "Close",
+            desc: "Close workspace",
+        });
+    }
+    match worktree_actions {
+        Some(true) => items.push(MenuItem::Action {
+            id: "delete_worktree",
+            label: "Delete worktree checkout...",
+            desc: "Remove worktree and delete directory",
+        }),
+        Some(false) => {
+            items.push(MenuItem::Action {
+                id: "new_worktree",
+                label: "New worktree",
+                desc: "Create and open new git worktree",
             });
-            for (i, f) in fields.iter().enumerate() {
-                items.push(MenuItem::Copy {
-                    field_idx: Some(i),
-                    label: f.label.to_owned(),
-                });
-            }
+            items.push(MenuItem::Action {
+                id: "open_worktree",
+                label: "Open worktree...",
+                desc: "Open existing git worktree",
+            });
         }
+        None => {}
+    }
+    if !items.is_empty() {
+        items.push(MenuItem::Separator);
+    }
+    items.push(MenuItem::Copy {
+        field_idx: None,
+        label: "Copy reference".into(),
+    });
+    for (i, f) in fields.iter().enumerate() {
+        items.push(MenuItem::Copy {
+            field_idx: Some(i),
+            label: f.label.to_owned(),
+        });
     }
     items
 }
 
-
 impl Menu {
+    fn select_prev(&mut self) {
+        let mut prev = self.selected.saturating_sub(1);
+        if matches!(self.items.get(prev), Some(MenuItem::Separator)) {
+            prev = prev.saturating_sub(1);
+        }
+        self.selected = prev;
+    }
+
+    fn select_next(&mut self) {
+        let mut next = (self.selected + 1).min(self.items.len().saturating_sub(1));
+        if matches!(self.items.get(next), Some(MenuItem::Separator)) {
+            next = (next + 1).min(self.items.len().saturating_sub(1));
+        }
+        self.selected = next;
+    }
+
     fn refresh(&mut self, projects: &[Project]) -> bool {
         let Some(row) = find(projects, &self.target) else {
             return false;
@@ -479,7 +424,7 @@ impl Menu {
                 .unwrap_or(0);
         }
         if matches!(self.items.get(self.selected), Some(MenuItem::Separator)) {
-            self.selected = (self.selected + 1).min(self.items.len().saturating_sub(1));
+            self.select_next();
         }
         true
     }
@@ -506,6 +451,17 @@ impl Menus {
             self.revision = self.revision.wrapping_add(1);
         }
     }
+
+    pub fn confirm_close(&mut self, workspace_id: String, name: String) {
+        self.open_dialog(Dialog::ConfirmCloseWorkspace { workspace_id, name });
+    }
+
+    fn open_dialog(&mut self, dialog: Dialog) {
+        self.current = None;
+        self.dialog = Some(dialog);
+        self.revision = self.revision.wrapping_add(1);
+    }
+
     pub fn open(&mut self, projects: &[Project], rows: &[Row], index: usize, anchor: (u16, u16)) {
         self.close();
         let Some((kind, id)) = row_key(projects, rows, index) else {
@@ -685,9 +641,6 @@ impl Menus {
         menu.rect = rect;
         menu.shown = usize::from(height - 2 - footer_height - preview_height - preview_gap);
         menu.offset = super::ensure_visible(menu.selected, menu.offset, menu.shown);
-        let _title_width = usize::from(width - 4)
-            - usize::from(menu.offset > 0)
-            - usize::from(menu.offset + menu.shown < menu.items.len());
         let mut title_str = format!(" {title} ");
         if menu.offset > 0 {
             title_str.push('↑');
@@ -702,15 +655,6 @@ impl Menus {
                 }
             }
         }
-        let bg_color = Color::Rgb(0x18, 0x18, 0x25);
-        for y in rect.y..rect.bottom() {
-            for x in rect.x..rect.right() {
-                let cell = &mut frame.buffer_mut()[(x, y)];
-                cell.set_symbol(" ");
-                cell.set_bg(bg_color);
-                cell.modifier = Modifier::empty();
-            }
-        }
         frame.render_widget(Clear, rect);
         frame.render_widget(
             Block::default()
@@ -719,7 +663,7 @@ impl Menus {
                     title_str,
                     Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
                 ))
-                .style(Style::default().bg(bg_color))
+                .style(Style::default().bg(POPUP_BG))
                 .border_style(Style::default().fg(theme.accent)),
             rect,
         );
@@ -745,7 +689,7 @@ impl Menus {
                     } else {
                         Style::default()
                             .fg(if ready { theme.idle_fresh } else { theme.dim })
-                            .bg(bg_color)
+                            .bg(POPUP_BG)
                     };
                     frame.render_widget(
                         Paragraph::new(format!("{} {label}", if selected { ">" } else { " " }))
@@ -778,7 +722,7 @@ impl Menus {
         frame.render_widget(
             Paragraph::new(preview)
                 .wrap(Wrap { trim: false })
-                .style(text_style.bg(bg_color)),
+                .style(text_style.bg(POPUP_BG)),
             Rect::new(
                 rect.x + 4,
                 rect.bottom() - 1 - footer_height - preview_height,
@@ -808,284 +752,6 @@ impl Menus {
         }
     }
 
-    fn draw_dialog(frame: &mut Frame, theme: &Theme, dialog: &Dialog) -> [Rect; 4] {
-        let area = frame.area();
-        let (title, prompt, input, btn_label, is_danger) = match dialog {
-            Dialog::Rename { input, .. } => (
-                "rename workspace",
-                "",
-                Some(input.as_str()),
-                "⏎save",
-                false,
-            ),
-            Dialog::ConfirmCloseWorkspace { .. } => (
-                "close workspace",
-                "",
-                None,
-                "⏎close",
-                true,
-            ),
-            Dialog::ConfirmDeleteWorktree { .. } => (
-                "delete worktree checkout",
-                "",
-                None,
-                "⏎delete",
-                true,
-            ),
-            Dialog::NewWorktree { input, .. } => (
-                "new worktree",
-                "branch: ",
-                Some(input.as_str()),
-                "⏎create",
-                false,
-            ),
-            Dialog::OpenWorktree { input, .. } => (
-                "open worktree",
-                "branch or path: ",
-                Some(input.as_str()),
-                "⏎open",
-                false,
-            ),
-        };
-
-        let card_w = area.width.saturating_sub(2).clamp(24, 46);
-        let card_h = 7.min(area.height.saturating_sub(2));
-        let rect = Rect::new(
-            area.x + area.width.saturating_sub(card_w) / 2,
-            area.y + area.height.saturating_sub(card_h) / 2,
-            card_w,
-            card_h,
-        );
-
-        for y in area.y..area.bottom() {
-            for x in area.x..area.right() {
-                frame.buffer_mut()[(x, y)].modifier.insert(Modifier::DIM);
-            }
-        }
-
-        let bg_color = Color::Rgb(0x18, 0x18, 0x25);
-        for y in rect.y..rect.bottom() {
-            for x in rect.x..rect.right() {
-                let cell = &mut frame.buffer_mut()[(x, y)];
-                cell.set_symbol(" ");
-                cell.set_bg(bg_color);
-                cell.modifier = Modifier::empty();
-            }
-        }
-
-        frame.render_widget(Clear, rect);
-        frame.render_widget(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Line::styled(
-                    format!(" {title} "),
-                    Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
-                ))
-                .style(Style::default().bg(bg_color))
-                .border_style(Style::default().fg(theme.accent)),
-            rect,
-        );
-
-        let content_text = if let Dialog::ConfirmDeleteWorktree { name, .. } = dialog {
-            format!("  Delete worktree checkout {name}?")
-        } else if let Dialog::ConfirmCloseWorkspace { name, .. } = dialog {
-            format!("  Close workspace {name}?")
-        } else if let Some(inp) = input {
-            format!("  {prompt}{inp}█")
-        } else {
-            format!("  {prompt}")
-        };
-        frame.render_widget(
-            Paragraph::new(content_text).style(Style::default().fg(theme.idle_fresh).bg(bg_color)),
-            Rect::new(rect.x + 1, rect.y + 2, rect.width.saturating_sub(2), 1),
-        );
-
-        let inner_w = rect.width.saturating_sub(2);
-        let btn_style = if is_danger {
-            Style::default()
-                .fg(theme.blocked)
-                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
-        } else {
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
-        };
-        let mut controls = Vec::new();
-        if inner_w >= 34 {
-            controls.push(Span::styled("   ", Style::default().bg(bg_color)));
-            controls.push(Span::styled(format!(" {btn_label} "), btn_style));
-            controls.push(Span::styled("   ", Style::default().bg(bg_color)));
-            if input.is_some() {
-                controls.push(Span::styled("^c clear", Style::default().fg(theme.dim).bg(bg_color)));
-                controls.push(Span::styled("   ", Style::default().bg(bg_color)));
-            }
-            controls.push(Span::styled("esc cancel", Style::default().fg(theme.dim).bg(bg_color)));
-        } else if inner_w >= 26 {
-            controls.push(Span::styled(" ", Style::default().bg(bg_color)));
-            controls.push(Span::styled(format!(" {btn_label} "), btn_style));
-            controls.push(Span::styled("  ", Style::default().bg(bg_color)));
-            if input.is_some() {
-                controls.push(Span::styled("^c", Style::default().fg(theme.dim).bg(bg_color)));
-                controls.push(Span::styled("  ", Style::default().bg(bg_color)));
-            }
-            controls.push(Span::styled("esc cancel", Style::default().fg(theme.dim).bg(bg_color)));
-        } else {
-            controls.push(Span::styled(format!("{btn_label}"), btn_style));
-            controls.push(Span::styled(" ", Style::default().bg(bg_color)));
-            if input.is_some() {
-                controls.push(Span::styled("^c", Style::default().fg(theme.dim).bg(bg_color)));
-                controls.push(Span::styled(" ", Style::default().bg(bg_color)));
-            }
-            controls.push(Span::styled("esc", Style::default().fg(theme.dim).bg(bg_color)));
-        }
-
-        let row = Rect::new(rect.x + 1, rect.y + 4, inner_w, 1);
-        // Hit rects follow the rendered spans (confirm button, clear and
-        // cancel hints), clipped to the row like the paragraph is.
-        let mut x = row.x;
-        let [mut confirm, mut clear, mut cancel] = [Rect::default(); 3];
-        for (i, span) in controls.iter().enumerate() {
-            let w = span.width() as u16;
-            let hit = Rect::new(x, row.y, w, 1).intersection(row);
-            if span.content.contains(btn_label) {
-                confirm = hit;
-            } else if span.content.starts_with("^c") {
-                clear = hit;
-            } else if i + 1 == controls.len() {
-                cancel = hit;
-            }
-            x = x.saturating_add(w);
-        }
-        frame.render_widget(
-            Paragraph::new(Line::from(controls)).style(Style::default().bg(bg_color)),
-            row,
-        );
-        [rect, confirm, clear, cancel]
-    }
-
-    fn input_dialog(&mut self, event: &Event, session: Option<&Session>) -> Option<String> {
-        let dialog = self.dialog.as_mut()?;
-        match event {
-            Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
-                KeyCode::Esc => return self.cancel_dialog(),
-                KeyCode::Char('c')
-                    if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
-                {
-                    if let Some(input) = dialog.input_mut() {
-                        input.clear();
-                        self.revision = self.revision.wrapping_add(1);
-                    }
-                }
-                KeyCode::Backspace => {
-                    if let Some(input) = dialog.input_mut() {
-                        input.pop();
-                        self.revision = self.revision.wrapping_add(1);
-                    }
-                }
-                KeyCode::Char(ch) => {
-                    if let Some(input) = dialog.input_mut() {
-                        input.push(ch);
-                        self.revision = self.revision.wrapping_add(1);
-                    }
-                }
-                KeyCode::Enter => return self.submit_dialog(session),
-                _ => {}
-            },
-            Event::Mouse(mouse)
-                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
-            {
-                let [card, confirm, clear, cancel] = self.dialog_hits;
-                let at = |r: Rect| r.contains((mouse.column, mouse.row).into());
-                if at(clear) {
-                    if let Some(input) = dialog.input_mut() {
-                        input.clear();
-                        self.revision = self.revision.wrapping_add(1);
-                    }
-                    return None;
-                }
-                if at(confirm) {
-                    return self.submit_dialog(session);
-                }
-                if at(cancel) || !at(card) {
-                    return self.cancel_dialog();
-                }
-            }
-            _ => {}
-        }
-        None
-    }
-
-    fn cancel_dialog(&mut self) -> Option<String> {
-        self.dialog = None;
-        self.revision = self.revision.wrapping_add(1);
-        Some(String::new())
-    }
-
-    /// Enter and the confirm button share one path.
-    fn submit_dialog(&mut self, session: Option<&Session>) -> Option<String> {
-        let d = self.dialog.take()?;
-        self.revision = self.revision.wrapping_add(1);
-        let Some(session) = session else {
-            return Some("Herdr session unavailable".into());
-        };
-        match d {
-            Dialog::Rename { workspace_id, input } => {
-                let label = input.trim();
-                if label.is_empty() {
-                    return Some("Workspace name cannot be empty".into());
-                }
-                match session.call(
-                    "workspace.rename",
-                    json!({ "workspace_id": workspace_id, "label": label }),
-                ) {
-                    Ok(_) => Some(format!("Renamed workspace to {label}")),
-                    Err(e) => Some(format!("Rename failed: {e}")),
-                }
-            }
-            Dialog::ConfirmCloseWorkspace { workspace_id, name } => {
-                match session.call("workspace.close", json!({ "workspace_id": workspace_id })) {
-                    Ok(_) => Some(format!("Closed workspace {name}")),
-                    Err(e) => Some(format!("Close failed: {e}")),
-                }
-            }
-            Dialog::ConfirmDeleteWorktree { workspace_id, name } => {
-                match session.call(
-                    "worktree.remove",
-                    json!({ "workspace_id": workspace_id, "force": false }),
-                ) {
-                    Ok(_) => Some(format!("Deleted worktree {name}")),
-                    Err(e) => Some(format!("Delete failed: {e}")),
-                }
-            }
-            Dialog::NewWorktree { workspace_id, input } => {
-                let branch = input.trim();
-                if branch.is_empty() {
-                    return Some("Branch name cannot be empty".into());
-                }
-                match session.call(
-                    "worktree.create",
-                    json!({ "workspace_id": workspace_id, "branch": branch }),
-                ) {
-                    Ok(_) => Some(format!("Created worktree {branch}")),
-                    Err(e) => Some(format!("Create worktree failed: {e}")),
-                }
-            }
-            Dialog::OpenWorktree { workspace_id, input } => {
-                let target = input.trim();
-                if target.is_empty() {
-                    return Some("Target cannot be empty".into());
-                }
-                match session.call(
-                    "worktree.open",
-                    json!({ "workspace_id": workspace_id, "branch": target }),
-                ) {
-                    Ok(_) => Some(format!("Opened worktree {target}")),
-                    Err(e) => Some(format!("Open worktree failed: {e}")),
-                }
-            }
-        }
-    }
-
     pub fn input(
         &mut self,
         event: &Event,
@@ -1107,20 +773,8 @@ impl Menus {
             Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
                 KeyCode::Esc | KeyCode::Char('q' | 'm') => close = true,
                 KeyCode::Enter => copy = true,
-                KeyCode::Up | KeyCode::Char('k') => {
-                    let mut prev = menu.selected.saturating_sub(1);
-                    if matches!(menu.items.get(prev), Some(MenuItem::Separator)) {
-                        prev = prev.saturating_sub(1);
-                    }
-                    menu.selected = prev;
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    let mut next = (menu.selected + 1).min(menu.items.len().saturating_sub(1));
-                    if matches!(menu.items.get(next), Some(MenuItem::Separator)) {
-                        next = (next + 1).min(menu.items.len().saturating_sub(1));
-                    }
-                    menu.selected = next;
-                }
+                KeyCode::Up | KeyCode::Char('k') => menu.select_prev(),
+                KeyCode::Down | KeyCode::Char('j') => menu.select_next(),
                 KeyCode::Home => menu.selected = 0,
                 KeyCode::End => menu.selected = menu.items.len().saturating_sub(1),
                 _ => {}
@@ -1154,20 +808,8 @@ impl Menus {
                             close = true;
                         }
                     }
-                    MouseEventKind::ScrollDown => {
-                        let mut next = (menu.selected + 1).min(menu.items.len().saturating_sub(1));
-                        if matches!(menu.items.get(next), Some(MenuItem::Separator)) {
-                            next = (next + 1).min(menu.items.len().saturating_sub(1));
-                        }
-                        menu.selected = next;
-                    }
-                    MouseEventKind::ScrollUp => {
-                        let mut prev = menu.selected.saturating_sub(1);
-                        if matches!(menu.items.get(prev), Some(MenuItem::Separator)) {
-                            prev = prev.saturating_sub(1);
-                        }
-                        menu.selected = prev;
-                    }
+                    MouseEventKind::ScrollDown => menu.select_next(),
+                    MouseEventKind::ScrollUp => menu.select_prev(),
                     _ => {}
                 }
             }
@@ -1189,55 +831,32 @@ impl Menus {
                 MenuItem::Action { id, .. } => {
                     let ws_id = menu.workspace_id.clone();
                     let ws_label = menu.workspace_label.clone();
-                    match id {
-                        "rename" => {
-                            self.current = None;
-                            self.dialog = Some(Dialog::Rename {
-                                workspace_id: ws_id,
-                                 input: ws_label,
-                             });
-                             self.revision = self.revision.wrapping_add(1);
-                             return None;
-                         }
+                    let dialog = match id {
+                        "rename" => Dialog::Rename {
+                            workspace_id: ws_id,
+                            input: ws_label,
+                        },
                         "close" => {
-                            self.current = None;
-                            self.dialog = Some(Dialog::ConfirmCloseWorkspace {
-                                workspace_id: ws_id,
-                                name: ws_label,
-                            });
-                            self.revision = self.revision.wrapping_add(1);
+                            self.confirm_close(ws_id, ws_label);
                             return None;
                         }
-                        "delete_worktree" => {
-                             self.current = None;
-                             self.dialog = Some(Dialog::ConfirmDeleteWorktree {
-                                 workspace_id: ws_id,
-                                 name: ws_label,
-                             });
-                             self.revision = self.revision.wrapping_add(1);
-                             return None;
-                         }
-                        "new_worktree" => {
-                             self.current = None;
-                             self.dialog = Some(Dialog::NewWorktree {
-                                 workspace_id: ws_id,
-                                 input: String::new(),
-                             });
-                             self.revision = self.revision.wrapping_add(1);
-                             return None;
-                         }
-                        "open_worktree" => {
-                             self.current = None;
-                             self.dialog = Some(Dialog::OpenWorktree {
-                                 workspace_id: ws_id,
-                                 input: String::new(),
-                             });
-                             self.revision = self.revision.wrapping_add(1);
-                             return None;
-                         }
-                         _ => {}
-                     }
-                 }
+                        "delete_worktree" => Dialog::ConfirmDeleteWorktree {
+                            workspace_id: ws_id,
+                            name: ws_label,
+                        },
+                        "new_worktree" => Dialog::NewWorktree {
+                            workspace_id: ws_id,
+                            input: String::new(),
+                        },
+                        "open_worktree" => Dialog::OpenWorktree {
+                            workspace_id: ws_id,
+                            input: String::new(),
+                        },
+                        _ => return None,
+                    };
+                    self.open_dialog(dialog);
+                    return None;
+                }
                 MenuItem::Separator => return None,
                 MenuItem::Copy { field_idx, .. } => {
                     if !ready || session.is_none() {
@@ -1704,131 +1323,6 @@ mod tests {
         let sel_cell = &terminal.backend().buffer()[(rect.x + 4, rect.y + 1)];
         assert!(sel_cell.modifier.contains(Modifier::REVERSED));
         assert_eq!(sel_cell.fg, theme.accent);
-    }
-
-    #[test]
-    fn rename_dialog_workflow() {
-        let mut projects = super::super::stub();
-        projects[0].worktrees[0].workspace_id = "w1".into();
-        let rows = super::super::visible(&projects, "", false, super::super::View::Grouped);
-
-        let mut menus = Menus::default();
-        menus.open(&projects, &rows, 1, (10, 5)); // open worktree menu
-
-        // Press Enter on Rename (index 0)
-        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        menus.input(&enter, &projects, None, true, &mut io::sink());
-
-        assert!(menus.dialog.is_some());
-        assert!(menus.current.is_none());
-        if let Some(Dialog::Rename { workspace_id, input }) = &menus.dialog {
-            assert_eq!(workspace_id, "w1");
-            assert_eq!(input, "main");
-        } else {
-            panic!("expected Rename dialog");
-        }
-
-        // Type new name
-        let ch_a = Event::Key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
-        menus.input(&ch_a, &projects, None, true, &mut io::sink());
-        if let Some(Dialog::Rename { input, .. }) = &menus.dialog {
-            assert_eq!(input, "main2");
-        }
-
-        // Backspace
-        let bs = Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
-        menus.input(&bs, &projects, None, true, &mut io::sink());
-        if let Some(Dialog::Rename { input, .. }) = &menus.dialog {
-            assert_eq!(input, "main");
-        }
-
-        // Ctrl+C clears
-        let ctrl_c = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
-        menus.input(&ctrl_c, &projects, None, true, &mut io::sink());
-        if let Some(Dialog::Rename { input, .. }) = &menus.dialog {
-            assert_eq!(input, "");
-        }
-
-        // Esc cancels
-        let esc = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        menus.input(&esc, &projects, None, true, &mut io::sink());
-        assert!(menus.dialog.is_none());
-        assert!(!menus.is_open());
-    }
-
-    #[test]
-    fn dialog_buttons_respond_to_mouse_where_drawn() {
-        use ratatui::{backend::TestBackend, Terminal};
-
-        let theme = super::super::load_theme();
-        let projects = super::super::stub();
-        let click = |column, row| {
-            Event::Mouse(crossterm::event::MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column,
-                row,
-                modifiers: KeyModifiers::NONE,
-            })
-        };
-        // Locate text on screen, not in our own rect math.
-        let locate = |terminal: &Terminal<TestBackend>, text: &str| {
-            let buffer = terminal.backend().buffer();
-            let want: Vec<char> = text.chars().collect();
-            (0..buffer.area.height)
-                .find_map(|y| {
-                    let row: Vec<char> = (0..buffer.area.width)
-                        .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
-                        .collect();
-                    row.windows(want.len())
-                        .position(|w| w == want.as_slice())
-                        .map(|x| (x as u16, y))
-                })
-                .unwrap_or_else(|| panic!("{text:?} not drawn"))
-        };
-        let dialogs = [
-            (Dialog::Rename { workspace_id: "w1".into(), input: "demo".into() }, "⏎save"),
-            (Dialog::ConfirmCloseWorkspace { workspace_id: "w1".into(), name: "demo".into() }, "⏎close"),
-            (Dialog::ConfirmDeleteWorktree { workspace_id: "w1".into(), name: "demo".into() }, "⏎delete"),
-            (Dialog::NewWorktree { workspace_id: "w1".into(), input: "demo".into() }, "⏎create"),
-            (Dialog::OpenWorktree { workspace_id: "w1".into(), input: "demo".into() }, "⏎open"),
-        ];
-        for width in [60, 30, 24] {
-            for (dialog, button) in &dialogs {
-                let case = format!("{button} at width {width}");
-                let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
-                let mut menus = Menus::default();
-                let open = |menus: &mut Menus, terminal: &mut Terminal<TestBackend>| {
-                    menus.dialog = Some(dialog.clone());
-                    terminal.draw(|f| menus.draw(f, &theme, true, Some(0))).unwrap();
-                };
-                open(&mut menus, &mut terminal);
-                let card = menus.dialog_hits[0];
-                menus.input(&click(card.x + 1, card.y + 1), &projects, None, true, &mut io::sink());
-                assert!(menus.dialog.is_some(), "{case}: a click inside the card must not dismiss");
-
-                if menus.dialog.as_mut().and_then(Dialog::input_mut).is_some() {
-                    let (x, y) = locate(&terminal, "^c");
-                    let msg = menus.input(&click(x, y), &projects, None, true, &mut io::sink());
-                    assert_eq!(msg, None, "{case}");
-                    assert_eq!(
-                        menus.dialog.as_mut().and_then(Dialog::input_mut).map(|s| s.as_str()),
-                        Some(""),
-                        "{case}: clicking ^c clears the input and keeps the dialog"
-                    );
-                }
-
-                let (x, y) = locate(&terminal, button);
-                let msg = menus.input(&click(x + 2, y), &projects, None, true, &mut io::sink());
-                assert_eq!(msg.as_deref(), Some("Herdr session unavailable"), "{case}");
-                assert!(menus.dialog.is_none(), "{case}");
-
-                open(&mut menus, &mut terminal);
-                let (x, y) = locate(&terminal, "esc");
-                let msg = menus.input(&click(x, y), &projects, None, true, &mut io::sink());
-                assert_eq!(msg.as_deref(), Some(""), "{case}");
-                assert!(menus.dialog.is_none(), "{case}");
-            }
-        }
     }
 
     #[test]

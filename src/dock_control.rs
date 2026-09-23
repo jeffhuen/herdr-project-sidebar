@@ -1,8 +1,8 @@
 //! One session-owned dock, transported by Herdr without restarting its process.
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::fs;
+use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 
 use crate::config::{self, Settings};
 use crate::ipc;
+use crate::util::{atomic_write, invalid, json_array};
 
 const SOURCE: &str = "plugin:herdr-project-sidebar:dock";
 
@@ -58,9 +59,7 @@ impl Pane {
 impl Controller {
     pub fn new(state_path: PathBuf) -> io::Result<Self> {
         let session = ipc::Session::current()?;
-        let socket = std::env::var_os("HERDR_SOCKET_PATH")
-            .ok_or_else(|| invalid("HERDR_SOCKET_PATH is not set"))?;
-        let metadata = fs::metadata(socket)?;
+        let metadata = fs::metadata(ipc::socket_path()?)?;
         let legacy_session = (metadata.dev(), metadata.ino());
         session.check()?;
         let session = session.key().to_owned();
@@ -156,41 +155,18 @@ impl Controller {
         if self.saved.as_ref() == Some(&self.state) {
             return Ok(());
         }
-        let parent = self
-            .path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| std::path::Path::new("."));
-        fs::create_dir_all(parent)?;
-        let temporary = self
-            .path
-            .with_extension(format!("{}.tmp", std::process::id()));
-        let result = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&temporary)?;
-            serde_json::to_writer(&mut file, &self.state)?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
-            fs::rename(&temporary, &self.path)?;
-            File::open(parent)?.sync_all()
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result?;
+        let mut bytes = serde_json::to_vec(&self.state)?;
+        bytes.push(b'\n');
+        atomic_write(&self.path, &bytes)?;
         self.saved = Some(self.state.clone());
         Ok(())
     }
 
     fn observe(&mut self, snapshot: &ipc::Snapshot) -> io::Result<Option<Pane>> {
         snapshot.session.check()?;
-        let panes = array(&snapshot.data, "panes")?;
-        let tabs = array(&snapshot.data, "tabs")?;
-        array(&snapshot.data, "layouts")?;
+        let panes = json_array(&snapshot.data, "panes")?;
+        let tabs = json_array(&snapshot.data, "tabs")?;
+        json_array(&snapshot.data, "layouts")?;
         if self.state.session != snapshot.session.key() {
             self.state = State {
                 session: snapshot.session.key().to_owned(),
@@ -395,7 +371,7 @@ impl Controller {
         }
         self.size(session, &pane, &live_layout, settings.width)?;
         // Recover a missing token after a successful open whose metadata reply failed.
-        if array(snapshot, "panes")?.iter().any(|p| {
+        if json_array(snapshot, "panes")?.iter().any(|p| {
             p["terminal_id"] == pane.terminal
                 && p.pointer("/tokens/hps_dock").and_then(Value::as_str) != Some("projects")
         }) {
@@ -455,21 +431,10 @@ impl Controller {
     }
 }
 
-fn invalid(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message.into())
-}
-
 fn text<'a>(value: &'a Value, key: &str) -> io::Result<&'a str> {
     value[key]
         .as_str()
         .filter(|text| !text.is_empty())
-        .ok_or_else(|| invalid(format!("native response omitted {key}")))
-}
-
-fn array<'a>(value: &'a Value, key: &str) -> io::Result<&'a [Value]> {
-    value[key]
-        .as_array()
-        .map(Vec::as_slice)
         .ok_or_else(|| invalid(format!("native response omitted {key}")))
 }
 
@@ -492,7 +457,7 @@ fn target(snapshot: &Value, caller_tab: Option<&str>) -> io::Result<Option<Pane>
     let Some(id) = id else {
         return Ok(None);
     };
-    let pane = array(snapshot, "panes")?
+    let pane = json_array(snapshot, "panes")?
         .iter()
         .find(|pane| pane["pane_id"] == id)
         .ok_or_else(|| invalid("caller or focused pane is absent from the current snapshot"))?;
@@ -500,14 +465,14 @@ fn target(snapshot: &Value, caller_tab: Option<&str>) -> io::Result<Option<Pane>
 }
 
 fn layout<'a>(snapshot: &'a Value, tab: &str) -> io::Result<&'a Value> {
-    array(snapshot, "layouts")?
+    json_array(snapshot, "layouts")?
         .iter()
         .find(|layout| layout["tab_id"] == tab)
         .ok_or_else(|| invalid("target tab has no current layout"))
 }
 
 fn pane_rect<'a>(layout: &'a Value, id: &str) -> io::Result<&'a Value> {
-    array(layout, "panes")?
+    json_array(layout, "panes")?
         .iter()
         .find(|pane| pane["pane_id"] == id)
         .map(|pane| &pane["rect"])
@@ -518,17 +483,12 @@ fn pane_rect<'a>(layout: &'a Value, id: &str) -> io::Result<&'a Value> {
 // content leaf; existing multi-row layouts keep their native tree and processes.
 fn content_target(layout: &Value, exclude: Option<&str>, right: bool) -> io::Result<String> {
     let mut chosen: Option<(&str, f64)> = None;
-    for pane in array(layout, "panes")? {
+    for pane in json_array(layout, "panes")? {
         let id = text(pane, "pane_id")?;
         if Some(id) == exclude {
             continue;
         }
-        let x = number(&pane["rect"], "x")?;
-        let edge = if right {
-            x + number(&pane["rect"], "width")?
-        } else {
-            -x
-        };
+        let edge = horizontal_edge(&pane["rect"], right)?;
         if chosen.is_none_or(|(_, old)| edge > old) {
             chosen = Some((id, edge));
         }

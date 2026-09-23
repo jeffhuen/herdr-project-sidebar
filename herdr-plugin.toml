@@ -1,6 +1,6 @@
 id = "herdr-project-sidebar"
 name = "Projects"
-version = "0.2.1"
+version = "0.2.2"
 description = "Project sidebar for Herdr: interactive terminal dock and native sidebar presentation."
 min_herdr_version = "0.9.1"
 platforms = ["linux", "macos"]

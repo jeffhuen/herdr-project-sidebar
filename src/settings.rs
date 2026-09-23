@@ -4,8 +4,8 @@ use std::time::Duration;
 use crate::config::{self, IconMode, Settings};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseButton, MouseEventKind,
+        self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -13,9 +13,9 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Position, Rect},
-    style::{Modifier, Style},
-    widgets::{Paragraph, Wrap},
-    Terminal,
+    style::{Color, Modifier, Style},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    Frame, Terminal,
 };
 
 pub const LABELS: [&str; 10] = [
@@ -47,7 +47,7 @@ struct RestoreTerminal;
 impl Drop for RestoreTerminal {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableMouseCapture, DisableFocusChange, LeaveAlternateScreen);
     }
 }
 
@@ -129,98 +129,174 @@ pub fn apply(settings: &mut Settings, row: usize, forward: bool) -> io::Result<S
     .to_owned())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum Outcome {
+    None,
+    Selected,
+    Edit { row: usize, forward: bool },
+    Close,
+}
+
+pub struct SettingsUi {
+    pub selected: usize,
+    offset: usize,
+    card: bool,
+    hits: [Rect; 10],
+    less: Rect,
+    more: Rect,
+    close: Rect,
+}
+
+impl SettingsUi {
+    pub fn new(card: bool) -> Self {
+        Self {
+            selected: 0, offset: 0, card,
+            hits: [Rect::default(); 10],
+            less: Rect::default(), more: Rect::default(), close: Rect::default(),
+        }
+    }
+
+    pub fn draw(&mut self, frame: &mut Frame, area: Rect, settings: &Settings,
+                message: &str, accent: Color, dim: Color) {
+        self.hits.fill(Rect::default());
+        self.less = Rect::default();
+        self.more = Rect::default();
+        let height = if self.card {
+            (area.height.saturating_sub(6) / 2).max(1)
+        } else {
+            area.height.saturating_sub(8).max(1)
+        }.min(LABELS.len() as u16) as usize;
+        if self.selected < self.offset {
+            self.offset = self.selected;
+        } else if self.selected >= self.offset + height {
+            self.offset = self.selected + 1 - height;
+        }
+        let shown = height.min(LABELS.len() - self.offset);
+        let inset = if self.card { 2 } else { 0 };
+        let step = if self.card { 2 } else { 1 };
+        if self.card {
+            frame.render_widget(Clear, area);
+            let mut title = String::from("Projects Settings");
+            if self.offset > 0 { title.push_str(" ↑"); }
+            if self.offset + shown < LABELS.len() { title.push_str(" ↓"); }
+            frame.render_widget(Block::default().borders(Borders::ALL).title(title), area);
+        }
+        self.close = Rect::new(
+            area.right().saturating_sub(if self.card { 9 } else { 7 }),
+            area.y, area.width.min(if self.card { 8 } else { 7 }), 1,
+        );
+        frame.render_widget(Paragraph::new("[Close]").style(Style::default().fg(accent)), self.close);
+        let mut rows = values(settings);
+        if self.card { rows[0] = format!("[←] {} [→]", settings.width); }
+        for row in self.offset..self.offset + shown {
+            let rect = Rect::new(area.x + inset, area.y + 2 + (row - self.offset) as u16 * step,
+                                 area.width.saturating_sub(inset * 2), 1);
+            if rect.y >= area.bottom() { break; }
+            self.hits[row] = rect;
+            let style = if row == self.selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else { Style::default() };
+            if !self.card { frame.render_widget(Paragraph::new("").style(style), rect); }
+            let value_width = (rows[row].chars().count() as u16).min(rect.width);
+            let label_width = rect.width.saturating_sub(value_width + 1);
+            frame.render_widget(
+                Paragraph::new(format!("{} {}", if row == self.selected { ">" } else { " " }, LABELS[row])).style(style),
+                Rect::new(rect.x, rect.y, label_width, 1),
+            );
+            let value = Rect::new(rect.right() - value_width, rect.y, value_width, 1);
+            frame.render_widget(Paragraph::new(rows[row].as_str()).style(style), value);
+            if row == 0 && value_width == rows[row].chars().count() as u16 {
+                self.less = Rect::new(value.x, value.y, 3, 1);
+                self.more = Rect::new(value.right() - 3, value.y, 3, 1);
+            }
+        }
+        let y = area.y + 3 + shown as u16 * step;
+        if y < area.bottom().saturating_sub(2) {
+            frame.render_widget(
+                Paragraph::new(if message.is_empty() { HELP[self.selected] } else { message })
+                    .wrap(Wrap { trim: true }).style(Style::default().fg(dim)),
+                Rect::new(area.x + inset, y, area.width.saturating_sub(inset * 2),
+                          area.bottom().saturating_sub(y + if self.card { 1 } else { 2 })),
+            );
+        }
+        if area.height > 1 {
+            frame.render_widget(
+                Paragraph::new(if self.card {
+                    "↑↓/jk move · ←→/hl change · click · esc closes"
+                } else { "Click to edit | arrows/jk/hl | Esc/s/q close" }).style(Style::default().fg(dim)),
+                Rect::new(area.x + inset, area.bottom() - if self.card { 2 } else { 1 },
+                          area.width.saturating_sub(inset * 2), 1),
+            );
+        }
+    }
+
+    pub fn input(&mut self, event: &Event) -> Outcome {
+        let previous = self.selected;
+        let mut edit = None;
+        match event {
+            Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
+                KeyCode::Esc | KeyCode::Char('q' | 's') => return Outcome::Close,
+                KeyCode::Char('c') if self.card || key.modifiers.contains(KeyModifiers::CONTROL) => return Outcome::Close,
+                KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => self.selected = (self.selected + 1).min(9),
+                KeyCode::Left | KeyCode::Char('h') => edit = Some(false),
+                KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => edit = Some(true),
+                KeyCode::Char(' ') if !self.card => edit = Some(true),
+                _ => {}
+            },
+            Event::Mouse(mouse) => {
+                let point = Position::new(mouse.column, mouse.row);
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if self.close.contains(point) { return Outcome::Close; }
+                        if self.less.contains(point) || self.more.contains(point) {
+                            if !self.card { self.selected = 0; }
+                            return Outcome::Edit { row: 0, forward: self.more.contains(point) };
+                        }
+                        if let Some(row) = self.hits.iter().position(|hit| hit.contains(point)) {
+                            self.selected = row;
+                            if self.card || row != 0 { edit = Some(true); }
+                        }
+                    }
+                    MouseEventKind::Moved if self.card => {
+                        if !self.close.contains(point) && !self.less.contains(point) && !self.more.contains(point) {
+                            if let Some(row) = self.hits.iter().position(|hit| hit.contains(point)) {
+                                self.selected = row;
+                            }
+                        }
+                    }
+                    MouseEventKind::ScrollUp => self.selected = self.selected.saturating_sub(1),
+                    MouseEventKind::ScrollDown => self.selected = (self.selected + 1).min(9),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        if let Some(forward) = edit {
+            Outcome::Edit { row: self.selected, forward }
+        } else if previous != self.selected {
+            Outcome::Selected
+        } else { Outcome::None }
+    }
+}
+
 pub fn run() -> io::Result<()> {
     let mut settings = config::load()?;
     enable_raw_mode()?;
     let _restore = RestoreTerminal;
-    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture, EnableFocusChange)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let mut selected = 0usize;
-    let mut offset = 0usize;
+    let mut ui = SettingsUi::new(false);
     let mut dirty = true;
     let mut message = String::new();
-    let mut hits = [Rect::default(); 10];
-    let mut less = Rect::default();
-    let mut more = Rect::default();
-    let mut close = Rect::default();
     loop {
         if dirty {
-            terminal.draw(|frame| {
-                let area = frame.area();
-                hits.fill(Rect::default());
-                less = Rect::default();
-                more = Rect::default();
-                close = Rect::new(area.right().saturating_sub(7), area.y, area.width.min(7), 1);
-                frame.render_widget(Paragraph::new("[Close]"), close);
-                let height = area
-                    .height
-                    .saturating_sub(8)
-                    .max(1)
-                    .min(LABELS.len() as u16) as usize;
-                if selected < offset {
-                    offset = selected;
-                }
-                if selected >= offset + height {
-                    offset = selected + 1 - height;
-                }
-                let rows = values(&settings);
-                for row in offset..(offset + height).min(LABELS.len()) {
-                    let rect = Rect::new(area.x, area.y + 2 + (row - offset) as u16, area.width, 1);
-                    if rect.y >= area.bottom() {
-                        break;
-                    }
-                    hits[row] = rect;
-                    let style = if row == selected {
-                        Style::default().add_modifier(Modifier::REVERSED)
-                    } else {
-                        Style::default()
-                    };
-                    frame.render_widget(Paragraph::new("").style(style), rect);
-                    let value_width = (rows[row].len() as u16).min(rect.width);
-                    let label_width = rect.width.saturating_sub(value_width + 1);
-                    frame.render_widget(
-                        Paragraph::new(format!(
-                            "{} {}",
-                            if row == selected { ">" } else { " " },
-                            LABELS[row]
-                        ))
-                        .style(style),
-                        Rect::new(rect.x, rect.y, label_width, 1),
-                    );
-                    let value = Rect::new(rect.right() - value_width, rect.y, value_width, 1);
-                    frame.render_widget(Paragraph::new(rows[row].as_str()).style(style), value);
-                    if row == 0 && value_width == rows[row].len() as u16 {
-                        less = Rect::new(value.x, value.y, 3, 1);
-                        more = Rect::new(value.right() - 3, value.y, 3, 1);
-                    }
-                }
-                let y = area.y + 3 + height as u16;
-                if y < area.bottom().saturating_sub(2) {
-                    let text = if message.is_empty() {
-                        HELP[selected]
-                    } else {
-                        &message
-                    };
-                    frame.render_widget(
-                        Paragraph::new(text).wrap(Wrap { trim: true }),
-                        Rect::new(area.x, y, area.width, area.bottom().saturating_sub(y + 2)),
-                    );
-                }
-                if area.height > 1 {
-                    frame.render_widget(
-                        Paragraph::new("Click to edit | arrows/jk/hl | Esc/s/q close"),
-                        Rect::new(area.x, area.bottom() - 1, area.width, 1),
-                    );
-                }
-            })?;
+            terminal.draw(|frame| ui.draw(frame, frame.area(), &settings, &message, Color::Reset, Color::Reset))?;
             dirty = false;
         }
         if !event::poll(Duration::from_secs(1))? {
             match config::load() {
-                Ok(next) if next != settings => {
-                    settings = next;
-                    dirty = true;
-                }
+                Ok(next) if next != settings => { settings = next; dirty = true; }
                 Err(error) => {
                     let text = error.to_string();
                     dirty |= text != message;
@@ -230,60 +306,29 @@ pub fn run() -> io::Result<()> {
             }
             continue;
         }
-        let mut edit = None;
-        let previous = selected;
-        match event::read()? {
-            Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
-                KeyCode::Esc | KeyCode::Char('q' | 's') => break,
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(9),
-                KeyCode::Left | KeyCode::Char('h') => edit = Some(false),
-                KeyCode::Right | KeyCode::Char('l' | ' ') | KeyCode::Enter => edit = Some(true),
-                _ => {}
-            },
-            Event::Mouse(mouse) => {
-                let point = Position::new(mouse.column, mouse.row);
-                match mouse.kind {
-                    MouseEventKind::Down(MouseButton::Left) if close.contains(point) => break,
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        if let Some(row) = hits.iter().position(|hit| hit.contains(point)) {
-                            selected = row;
-                            if row != 0 {
-                                edit = Some(true);
-                            } else if less.contains(point) {
-                                edit = Some(false);
-                            } else if more.contains(point) {
-                                edit = Some(true);
-                            }
-                        }
-                    }
-                    MouseEventKind::ScrollUp => selected = selected.saturating_sub(1),
-                    MouseEventKind::ScrollDown => selected = (selected + 1).min(9),
-                    _ => {}
-                }
-            }
-            Event::Resize(_, _) => dirty = true,
-            _ => {}
-        }
-        if selected != previous {
+        let event = event::read()?;
+        dirty |= matches!(event, Event::Resize(_, _));
+        let previous = ui.selected;
+        let outcome = ui.input(&event);
+        if ui.selected != previous {
             message.clear();
             dirty = true;
         }
-        if let Some(forward) = edit {
-            let before = settings.clone();
-            match apply(&mut settings, selected, forward) {
-                Ok(msg) => {
-                    if settings != before || !msg.is_empty() {
-                        message = msg;
-                        dirty = true;
+        match outcome {
+            Outcome::Close => break,
+            Outcome::Edit { row, forward } => {
+                let before = settings.clone();
+                match apply(&mut settings, row, forward) {
+                    Ok(msg) => {
+                        if settings != before || !msg.is_empty() {
+                            message = msg;
+                            dirty = true;
+                        }
                     }
-                }
-                Err(error) => {
-                    message = error.to_string();
-                    dirty = true;
+                    Err(error) => { message = error.to_string(); dirty = true; }
                 }
             }
+            Outcome::None | Outcome::Selected => {}
         }
     }
     Ok(())
@@ -292,6 +337,46 @@ pub fn run() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rendered_controls_edit_their_rows_and_scrolling_exposes_later_settings() {
+        use crossterm::event::{KeyEvent, MouseEvent};
+        for card in [false, true] {
+            let mut ui = SettingsUi::new(card);
+            let mut settings = Settings::default();
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(58, 18)).unwrap();
+            terminal.draw(|frame| ui.draw(frame, frame.area(), &settings, "", Color::Cyan, Color::DarkGray)).unwrap();
+            let click = |x, y| Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left), column: x, row: y,
+                modifiers: KeyModifiers::NONE,
+            });
+            let position = |terminal: &Terminal<ratatui::backend::TestBackend>, needle: &str| {
+                (0..18).find_map(|y| {
+                    let line: String = (0..58).map(|x| terminal.backend().buffer()[(x, y)].symbol()).collect();
+                    line.find(needle).map(|byte| (line[..byte].chars().count() as u16, y))
+                }).unwrap()
+            };
+            for (needle, width) in [(if card { "[←]" } else { "[-]" }, 28),
+                                    (if card { "[→]" } else { "[+]" }, 30)] {
+                let (x, y) = position(&terminal, needle);
+                let Outcome::Edit { row, forward } = ui.input(&click(x, y)) else { panic!("width control did not edit") };
+                change(&mut settings, row, forward);
+                assert_eq!(settings.width, width);
+            }
+            let (x, y) = position(&terminal, "Dock side");
+            let Outcome::Edit { row, forward } = ui.input(&click(x, y)) else { panic!("row did not edit") };
+            change(&mut settings, row, forward);
+            assert!(!settings.dock_right);
+            for _ in 0..8 {
+                ui.input(&Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+            }
+            terminal.draw(|frame| ui.draw(frame, frame.area(), &settings, "", Color::Cyan, Color::DarkGray)).unwrap();
+            let (x, y) = position(&terminal, "[Install]");
+            assert_eq!(ui.input(&click(x, y)), Outcome::Edit { row: 9, forward: true });
+            let (x, y) = position(&terminal, "[Close]");
+            assert_eq!(ui.input(&click(x, y)), Outcome::Close);
+        }
+    }
 
     #[test]
     fn dock_side_row_toggles_without_shifting_width() {
@@ -303,12 +388,8 @@ mod tests {
         assert_eq!(values(&settings)[1], "Left");
         change(&mut settings, 1, false);
         assert!(settings.dock_right);
-        // Width still lives at row 0 after the insert.
         change(&mut settings, 0, true);
         assert_eq!(settings.width, 32);
-        assert_eq!(LABELS.len(), 10);
-        assert_eq!(HELP.len(), 10);
-        assert_eq!(values(&settings).len(), 10);
     }
 
     #[test]

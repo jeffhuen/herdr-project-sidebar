@@ -8,6 +8,19 @@ pub fn spinner(step: usize) -> &'static str {
     FRAMES[step % FRAMES.len()]
 }
 
+pub(crate) fn clean_agent_title<'a>(agent: &str, title: &'a str, bare_pi: bool) -> &'a str {
+    if matches!(agent, "omp" | "pi") {
+        title.strip_prefix("π ")
+            .or_else(|| bare_pi.then(|| title.strip_prefix('π')).flatten())
+            .unwrap_or(title)
+            .trim_start_matches(|ch: char| {
+                ch.is_whitespace() || ch == '>' || ('\u{2800}'..='\u{28ff}').contains(&ch)
+            })
+    } else {
+        title
+    }
+}
+
 pub fn blocked_mark(step: usize) -> &'static str {
     if (step / 3) % 2 == 1 {
         "·"
@@ -27,6 +40,9 @@ pub fn state_mark(state: &str) -> &'static str {
 }
 
 pub fn logo(agent: &str, mode: IconMode) -> Option<&'static str> {
+    if mode == IconMode::None {
+        return None;
+    }
     let (font, text) = match agent {
         "claude" => ("\u{e1a0}", "§"),
         "codex" => ("\u{e1a1}", "Λ"),
@@ -59,36 +75,6 @@ pub fn logo(agent: &str, mode: IconMode) -> Option<&'static str> {
         IconMode::Text => Some(text),
         IconMode::None => None,
     }
-}
-
-#[allow(dead_code)]
-pub fn all_vendors() -> &'static [&'static str] {
-    &[
-        "claude",
-        "codex",
-        "opencode",
-        "omp",
-        "cline",
-        "mastracode",
-        "kimi",
-        "kilo",
-        "maki",
-        "pi",
-        "hermes",
-        "cursor",
-        "copilot",
-        "deepseek",
-        "gemini",
-        "gpt",
-        "qwen",
-        "grok",
-        "agy",
-        "kiro",
-        "amp",
-        "devin",
-        "qodercli",
-        "glm",
-    ]
 }
 
 pub fn install() -> io::Result<PathBuf> {

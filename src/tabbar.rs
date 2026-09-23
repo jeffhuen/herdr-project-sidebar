@@ -3,17 +3,12 @@ use std::io::{self, Write};
 /// Herdr supplies the active cwd. Read its Git HEAD without querying the server.
 pub fn format_tabbar() -> io::Result<()> {
     let cwd = std::env::var("HERDR_ACTIVE_PANE_CWD").unwrap_or_default();
-    let branch = crate::native::git_branch(std::path::Path::new(&cwd));
-    print!("{}", compose_tabbar(cwd_opt(&cwd), branch.as_deref()));
+    let branch = crate::git::git_branch(std::path::Path::new(&cwd));
+    print!(
+        "{}",
+        compose_tabbar((!cwd.is_empty()).then_some(cwd.as_str()), branch.as_deref())
+    );
     io::stdout().flush()
-}
-
-fn cwd_opt(cwd: &str) -> Option<&str> {
-    if cwd.is_empty() {
-        None
-    } else {
-        Some(cwd)
-    }
 }
 
 pub fn compose_tabbar(cwd: Option<&str>, branch: Option<&str>) -> String {
@@ -43,16 +38,15 @@ pub fn shorten_path(cwd: &str, max_len: usize) -> String {
         };
     }
 
-    let parts: Vec<&str> = formatted.split('/').collect();
-    let mut cur = parts.as_slice();
-    while cur.len() > 2 {
-        cur = &cur[1..];
-        let candidate = format!("…/{}", cur.join("/"));
-        if candidate.len() <= max_len {
-            return candidate;
+    let mut suffix = formatted.as_str();
+    let separators = formatted.bytes().filter(|&byte| byte == b'/').count();
+    for _ in 1..separators {
+        suffix = suffix.split_once('/').unwrap().1;
+        if "…/".len() + suffix.len() <= max_len {
+            break;
         }
     }
-    format!("…/{}", cur.join("/"))
+    format!("…/{suffix}")
 }
 
 #[cfg(test)]

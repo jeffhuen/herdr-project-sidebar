@@ -10,11 +10,13 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::util::invalid;
+
 pub fn call(method: &str, params: Value) -> io::Result<Value> {
     call_at(&socket_path()?, method, params)
 }
 
-fn socket_path() -> io::Result<PathBuf> {
+pub(crate) fn socket_path() -> io::Result<PathBuf> {
     std::env::var_os("HERDR_SOCKET_PATH")
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HERDR_SOCKET_PATH is not set"))
@@ -173,10 +175,6 @@ fn snapshot_at(socket: &Path) -> io::Result<Snapshot> {
         session,
         data: snapshot,
     })
-}
-
-fn invalid(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
 pub const SYNC_CHECK_INTERVAL: Duration = Duration::from_millis(50);

@@ -1,6 +1,6 @@
 [package]
 name = "herdr-project-sidebar"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Project sidebar for Herdr: interactive terminal dock and native sidebar presentation."
 license = "MIT"

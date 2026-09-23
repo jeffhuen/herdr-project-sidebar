@@ -6,11 +6,13 @@ pub mod activity;
 mod config;
 pub mod dock;
 mod dock_control;
+mod git;
 mod icons;
 mod ipc;
 mod native;
 mod settings;
 pub mod tabbar;
+mod util;
 
 fn reload() -> io::Result<()> {
     let result = ipc::call("server.reload_config", json!({}))?;
@@ -32,7 +34,6 @@ fn main() -> io::Result<()> {
         Some("--ensure" | "ensure") => {
             native::dock_command(dock_control::Command::Ensure, &ipc::Session::current()?)
         }
-        Some("--dump-snapshot") => dock::run(),
         Some("--configure") => {
             config::configure()?;
             native::start()

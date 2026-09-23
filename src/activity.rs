@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs::File;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crate::util::{atomic_write, open_lock};
 
 const WRITE_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_STATE_BYTES: u64 = 4 * 1024 * 1024;
@@ -101,14 +103,8 @@ impl ActivityStore {
             .as_ref()
             .ok_or_else(|| io::Error::other("activity session is not synchronized"))?;
         session.check()?;
-        fs::create_dir_all(&self.state_dir)?;
         let path = self.path(session);
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path.with_extension("lock"))?;
+        let lock = open_lock(&path.with_extension("lock"))?;
         lock.lock()?;
         // Under the file lock, an old writer cannot replace a new session's
         // history. The scope lives in one file per socket, not one per restart.
@@ -137,18 +133,7 @@ impl ActivityStore {
                 "activity state exceeds size limit",
             ));
         }
-        // The session lock serializes threads and processes, including temp-file use.
-        let temporary = path.with_extension("tmp");
-        let written = (|| {
-            let mut file = File::create(&temporary)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            fs::rename(&temporary, &path)
-        })();
-        if let Err(error) = written {
-            let _ = fs::remove_file(&temporary);
-            return Err(error);
-        }
+        atomic_write(&path, &bytes)?;
         self.stamps = saved.stamps;
         self.last_write = Some(Instant::now());
         self.dirty = false;
@@ -208,6 +193,7 @@ pub fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -326,10 +312,10 @@ mod tests {
         let mut store = directory.store();
         store.mark_working("terminal", 1_000);
         store.retain_live(&HashSet::from(["terminal"]));
-        let temporary = store.path(&directory.session()).with_extension("tmp");
-        fs::create_dir(&temporary).unwrap();
+        let path = store.path(&directory.session());
+        fs::create_dir(&path).unwrap();
         assert!(store.save(false).is_err());
-        fs::remove_dir(&temporary).unwrap();
+        fs::remove_dir(&path).unwrap();
         store.save(false).unwrap();
         assert_eq!(
             directory.store().freshness("terminal", 2_000),
