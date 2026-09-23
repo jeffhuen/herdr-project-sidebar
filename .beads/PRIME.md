@@ -21,6 +21,7 @@ A recovery checkpoint records:
 - What changed and what you verified. Distinguish evidence from attempts and helper reports.
 - What remains, any blocker, and the next action.
 - Relevant checkouts or branches, running agents that can write, and who owns integration and cleanup.
+- For each agent that may need to resume: its session reference and launch flags, such as `-e` entrypoints and tool restrictions. Record the names of required environment variables and the settings of restriction variables such as `PI_BEADS_COMPANION_READONLY=1`. Never record credentials.
 
 On resume, read the governing bead and its latest checkpoint. Compare them with the checkout and running agents before continuing. A checkpoint or session summary may no longer match the files or processes.
 
@@ -28,7 +29,7 @@ On resume, read the governing bead and its latest checkpoint. Compare them with 
 
 The coordinator is the agent responsible for the whole outcome. Other agents are helpers. One coordinator owns bead updates, verification, closure, integration, and cleanup unless ownership transfers. Helpers report results and blockers. They must not claim or close the coordinator's bead on their own. Selecting an issue in the companion does not claim it.
 
-Work directly or use native delegation when it fits the task. Native OMP agents support model selection, supervision, and follow-up. Use Herdr when you need separate full CLI sessions. Keep its official integration separate. This companion does not launch agents or manage terminals, worktrees, approvals, or session identities.
+Work directly or use native delegation when it fits the task. Native OMP agents support model selection, supervision, and follow-up. For helper delegation, use Herdr only when the user asks for a separate full CLI session. Keep its official integration separate. This companion does not launch agents or manage terminals, worktrees, approvals, or session identities. The repository's execution workflow, such as `skill://herdr-workflow`, owns those procedures.
 
 Give each helper one automated supervisor. Give each checkout and terminal one owner responsible for its use and cleanup. Confirm each writer's checkout. Isolate or serialize concurrent writers and integration. A terminal pane does not isolate files. Before cleanup, account for each helper's subagents and any process that can still write. If prompt delivery is unclear, inspect the session before retrying.
 
@@ -59,7 +60,7 @@ bd --sandbox close ISSUE_ID
 
 For work tracked in a bead, completion includes its final update. Finishing the native todo list is not sufficient:
 
-1. Verify the integrated result against the governing bead's acceptance criteria. A helper's report, an idle pane, or completed todos do not prove acceptance.
+1. Verify the result against the governing bead's acceptance criteria. If the outcome requires integration, verify the integrated result. A helper's report, an idle pane, or completed todos do not prove acceptance.
 2. Check for remaining work and running agents that can still change the result. If acceptance is incomplete, leave the bead open with a recovery checkpoint.
 3. If acceptance is met and closure is authorized, record the final evidence. Close the bead through `bd` before reporting it complete.
 4. If closure is unauthorized or fails, report the verified implementation result and the still-open bead separately. Do not claim the bead is complete.
