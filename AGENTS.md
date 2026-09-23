@@ -29,6 +29,8 @@ Use [pi-beads-companion](https://github.com/jeffhuen/pi-beads-companion) for the
 
 Choose branch isolation separately from issue tracking. Preserve other writers' work and use only authorized Git and remote operations. Herdr manages resources it creates, not the harness's internal isolation.
 
+Review uses the canonical L0–L3 ladder in `skill://herdr-workflow` section 6.
+
 ## Code discovery
 
 No symbol or concept graphs are configured for this repository yet. For exact text, scripts, configuration, and source, use direct search and source reads.
