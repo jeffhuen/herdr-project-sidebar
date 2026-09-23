@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-23
+
 ### Added
 
 - Copy-only menus for project, worktree, and agent rows in the terminal dock.
@@ -12,6 +14,22 @@
   including SSH sessions. Repository details are looked up only on demand.
 - Keep open menus attached to stable row identities. Refresh moved agents' IDs
   and dismiss menus when their target, conversation, or server disappears.
+- Workspace actions in the dock menus, above the copy references. Linked
+  worktree rows offer **Rename**, **Close**, and **Delete worktree checkout...**.
+  Main checkout rows offer **Rename**, **Close**, **New worktree**, and
+  **Open worktree...**.
+- Project headers offer **New worktree** and **Open worktree...**. They also
+  offer **Rename** and **Close** when the project has one workspace.
+- **Close** and **Delete worktree checkout...** ask for confirmation.
+  **Delete worktree checkout...** does not force the removal of a checkout that
+  has changes.
+- Dialogs respond to the keyboard and the mouse. Enter or the confirm button
+  submits. `^c` clears the input. Esc, the `esc cancel` hint, or a click outside
+  the dialog cancels.
+- Menus and dialogs use Herdr's `[ui] accent` color and an opaque background.
+  Dialog controls use shorter labels in narrow docks.
+- A **[+ New]** button in the footer, opposite **[⚙ Settings]**. The agent
+  summary moves to a separate line above the buttons.
 
 ### Changed
 
@@ -24,6 +42,14 @@
   and worktrees. Use the nearest checkout, including submodules. Run the native
   tab-bar formatter with `exec` instead of retaining a shell parent.
 - Serialize each IPC request once and write it as one complete JSON line.
+- **[+ New]** and `N` focus the terminal of the new workspace. Herdr sets its
+  directory with its CWD policy, using the current workspace as the source.
+- The footer uses muted theme colors without bold: the accent for the buttons
+  and the working color for the agent summary. `MUTE_SATURATION` and
+  `MUTE_BRIGHTNESS` in `src/dock.rs` set the amount.
+- Footer messages clear after 4 seconds and the agent summary returns. An
+  expired "press D again" prompt also clears, so the next `D` asks again.
+- Worktree rows without agents do not show a fold marker.
 
 ### Fixed
 
@@ -51,6 +77,10 @@
   Disabled `--start` calls no longer launch a daemon.
 - Detect native plugin disable or removal through periodic registry checks, then
   restore owned configuration, clear metadata, close the dock, and exit.
+- Clicking a worktree row opens its workspace, as in the native sidebar.
+  Clicking the fold marker still folds the row.
+- The cursor stays on a clicked worktree row and does not jump to the project
+  header.
 
 ### Known issues
 
@@ -111,5 +141,6 @@ First tagged release. Earlier development builds were available from `main`.
 - Herdr 0.9.1 can override a mouse activation with a late pane-focus operation.
   Keyboard Enter avoids this race. See [Herdr #4390](https://github.com/herdrdev/herdr/issues/4390).
 
-[Unreleased]: https://github.com/jeffhuen/herdr-project-sidebar/compare/v0.2.0...main
+[Unreleased]: https://github.com/jeffhuen/herdr-project-sidebar/compare/v0.2.1...main
+[0.2.1]: https://github.com/jeffhuen/herdr-project-sidebar/releases/tag/v0.2.1
 [0.2.0]: https://github.com/jeffhuen/herdr-project-sidebar/releases/tag/v0.2.0

@@ -36,6 +36,8 @@ const TICK: Duration = Duration::from_millis(300);
 const IDLE_POLL: Duration = Duration::from_millis(300);
 const NO_SELECTION: usize = usize::MAX;
 const BRANCH_TTL: Duration = Duration::from_secs(5);
+/// Transient footer messages yield back to the agent summary after this.
+const STATUS_TTL: Duration = Duration::from_secs(4);
 /// Explicit holds outvote adopted vetoes this long; afterwards recency is
 /// unknowable and vetoes apply normally so stale pins always converge away.
 const VETO_GRACE_SECS: u64 = 60;
@@ -114,6 +116,7 @@ struct Worktree {
     depth: usize,
     /// Owning workspace: the focus target for this row.
     workspace_id: String,
+    focused: bool,
     agents: Vec<Agent>,
 }
 
@@ -203,6 +206,7 @@ fn stub() -> Vec<Project> {
                 collapsed: false,
                 depth: 0,
                 workspace_id: "".into(),
+                focused: false,
                 agents: vec![
                     Agent {
                         vendor: "pi".into(),
@@ -269,6 +273,7 @@ fn stub() -> Vec<Project> {
                 collapsed: false,
                 depth: 0,
                 workspace_id: "".into(),
+                focused: false,
                 agents: vec![Agent {
                     vendor: "claude".into(),
                     label: "claude".into(),
@@ -623,11 +628,17 @@ fn focus_row(projects: &[Project], rows: &[Row], pane_id: &str) -> Option<usize>
     })
 }
 
-/// Seat target: the focused session's row, else the focused space's header.
+/// Seat target: the focused session's row, else the focused space's worktree/header.
 /// Never outside the active space.
 fn seat_row(projects: &[Project], rows: &[Row], focused_pane: Option<&str>) -> Option<usize> {
     focused_pane
         .and_then(|id| focus_row(projects, rows, id))
+        .or_else(|| {
+            rows.iter().position(|r| match *r {
+                Row::Worktree(pi, wi) => projects[pi].worktrees[wi].focused,
+                _ => false,
+            })
+        })
         .or_else(|| {
             rows.iter()
                 .position(|r| matches!(*r, Row::Project(pi) if projects[pi].focused))
@@ -917,6 +928,7 @@ fn snapshot(
                     PJKey::Repo(_) => sub.clone(),
                     PJKey::Solo(_) => id.clone(),
                 },
+                focused: member_ws.map_or(false, |w| w.focused),
                 agents: list,
             });
         }
@@ -1051,7 +1063,25 @@ struct Theme {
     idle_stale: Color,
     unknown: Color,
     dim: Color,
+    /// Herdr's `[ui] accent`: pane borders, popups, navigation highlights.
+    accent: Color,
     projects: Vec<Color>,
+}
+
+/// Footer chrome is a notch quieter than the theme: same hue, less saturation
+/// and brightness. Tune these two knobs; 1.0 is the raw theme color.
+const MUTE_SATURATION: f32 = 0.6;
+const MUTE_BRIGHTNESS: f32 = 0.85;
+
+/// Pull toward the color's own luma gray (keeps hue), then darken. Named
+/// terminal colors have no RGB to adjust and pass through unchanged.
+fn mute(color: Color) -> Color {
+    let Color::Rgb(r, g, b) = color else {
+        return color;
+    };
+    let gray = 0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b);
+    let ch = |c: u8| ((gray + (f32::from(c) - gray) * MUTE_SATURATION) * MUTE_BRIGHTNESS).round() as u8;
+    Color::Rgb(ch(r), ch(g), ch(b))
 }
 
 fn parse_hex(s: &str) -> Option<Color> {
@@ -1161,6 +1191,8 @@ fn load_theme() -> Theme {
         idle_stale: Color::Rgb(0x6c, 0x70, 0x86),
         unknown: Color::Rgb(0x90, 0x7a, 0xa9),
         dim: Color::DarkGray,
+        // Herdr's documented `[ui] accent` default.
+        accent: Color::Cyan,
         projects: vec![
             Color::Rgb(0xcb, 0xa6, 0xf7),
             Color::Rgb(0x89, 0xb4, 0xfa),
@@ -1185,6 +1217,12 @@ fn load_theme() -> Theme {
             .unwrap_or(fb)
     };
     let working = get("working", &["yellow"], fallback.working);
+    // Section-aware: `[ui] accent` differs from `[theme.custom] accent`.
+    let accent = text
+        .parse::<toml_edit::DocumentMut>()
+        .ok()
+        .and_then(|doc| doc.get("ui")?.get("accent")?.as_str()?.parse::<Color>().ok())
+        .unwrap_or(fallback.accent);
     Theme {
         working,
         monitoring: get("monitoring", &["yellow", "peach"], working),
@@ -1195,6 +1233,7 @@ fn load_theme() -> Theme {
         idle: get("idle", &["overlay0"], fallback.idle),
         idle_stale: get("idle_stale", &["overlay0"], fallback.idle_stale),
         unknown: get("unknown", &["mauve", "overlay1"], fallback.unknown),
+        accent,
         dim: fallback.dim,
         projects: fallback.projects.clone(),
     }
@@ -1745,6 +1784,7 @@ pub fn run() -> io::Result<()> {
     let mut settings_row = 0usize;
     let mut settings_offset = 0usize;
     let mut settings_obj = crate::config::load().unwrap_or_default();
+    let mut new_btn = ratatui::layout::Rect::default();
     let mut settings_btn = ratatui::layout::Rect::default();
     let mut close_btn = ratatui::layout::Rect::default();
     let mut less_btn = ratatui::layout::Rect::default();
@@ -1772,6 +1812,7 @@ pub fn run() -> io::Result<()> {
     let mut view = View::Grouped;
     let mut confirm_close: Option<Vec<String>> = None;
     let mut status_line: String = String::new();
+    let mut status_seen = (String::new(), std::time::Instant::now());
 
     // A panic or an I/O error must never brick the shell: without this the
     // terminal stays in raw mode on the alternate screen with mouse capture
@@ -1917,7 +1958,7 @@ pub fn run() -> io::Result<()> {
         if selected != NO_SELECTION && selected >= rows.len() {
             selected = rows.len().saturating_sub(1);
         }
-        let height = term.size()?.height.saturating_sub(1) as usize;
+        let height = term.size()?.height.saturating_sub(2) as usize;
         // Clamp the window itself: when rows shrink under a high offset the
         // viewport would otherwise anchor on the last row and draw blanks.
         if selected != NO_SELECTION {
@@ -1926,6 +1967,14 @@ pub fn run() -> io::Result<()> {
         offset = offset.min(rows.len().saturating_sub(height));
         let (window, slid) = window_for_selected(&rows, offset, height, selected);
         offset = slid;
+        // Messages are transient: expire back to the summary. An expired
+        // "press D again" prompt must not leave its second press armed.
+        if status_line != status_seen.0 {
+            status_seen = (status_line.clone(), std::time::Instant::now());
+        } else if !status_line.is_empty() && status_seen.1.elapsed() >= STATUS_TTL {
+            status_line.clear();
+            confirm_close = None;
+        }
         let working = window.iter().flatten().any(|&idx| match rows[idx] {
             Row::Agent(pi, wi, ai) => {
                 let (g, anim) = state_glyph(projects[pi].worktrees[wi].agents[ai].state, 0, font);
@@ -2026,7 +2075,13 @@ pub fn run() -> io::Result<()> {
                     }
                     Row::Worktree(pi, wi) => {
                         let w = &projects[pi].worktrees[wi];
-                        let mark = if w.collapsed { "▸" } else { "▾" };
+                        let mark = if w.agents.is_empty() {
+                            ""
+                        } else if w.collapsed {
+                            "▸ "
+                        } else {
+                            "▾ "
+                        };
                         // Places, not pointers: the main line carries the branch
                         // fork, peer checkouts a tree; only true children take
                         // the └─ connector (plus one indent per level below).
@@ -2050,7 +2105,7 @@ pub fn run() -> io::Result<()> {
                         };
                         Line::from(vec![
                             Span::styled(lead, Style::default().fg(theme.dim)),
-                            Span::raw(format!("{mark} {} ", w.name)),
+                            Span::raw(format!("{mark}{} ", w.name)),
                         ])
                     }
                     Row::Agent(pi, wi, ai) => {
@@ -2168,39 +2223,55 @@ pub fn run() -> io::Result<()> {
                     for s in &mut nl.spans { s.style = s.style.add_modifier(bg_dim); }
                     nl
                 }).collect();
-                let content_h = area.height.saturating_sub(1);
+                let content_h = area.height.saturating_sub(2);
                 let content_rect = ratatui::layout::Rect::new(area.x, area.y, area.width, content_h);
                 f.render_widget(Paragraph::new(dim_lines), content_rect);
 
-                // Bottom toolbar: transient messages replace the summary, not Settings.
-                let footer_y = area.bottom().saturating_sub(1);
-                let btn_text = " [⚙ Settings] ";
-                let btn_w = (btn_text.chars().count() as u16).min(area.width);
-                settings_btn = ratatui::layout::Rect::new(area.right() - btn_w, footer_y, btn_w, 1);
-                let mut footer_style = Style::default().fg(theme.dim);
-                let bottom = if let Some(e) = sync_error.as_deref() {
-                    format!("herdr unreachable: {e} (retrying)")
+                // Two-line bottom toolbar:
+                // Line 1: Summary / Status line
+                let summary_y = area.bottom().saturating_sub(2);
+                let buttons_y = area.bottom().saturating_sub(1);
+
+                let dim = Style::default().fg(theme.dim);
+                let (bottom, footer_style) = if let Some(e) = sync_error.as_deref() {
+                    (format!("herdr unreachable: {e} (retrying)"), dim)
                 } else if sync.is_stale() {
-                    "refreshing Herdr snapshot".into()
+                    ("refreshing Herdr snapshot".into(), dim)
                 } else if filtering {
-                    format!("filter: {query}  (enter/esc done)")
+                    (format!("filter: {query}  (enter/esc done)"), dim)
                 } else if !status_line.is_empty() {
-                    status_line.clone()
+                    (status_line.clone(), dim)
                 } else if let Some(error) = &activity_error {
-                    format!("activity save failed: {error}")
+                    (format!("activity save failed: {error}"), dim)
                 } else if font_notice {
-                    "Nerd Font not found - ASCII icons - F font options".into()
+                    ("Nerd Font not found - ASCII icons - F font options".into(), dim)
                 } else {
-                    footer_style = Style::default().fg(theme.working).add_modifier(Modifier::BOLD);
-                    format!(" {agents} agents · {working_n} working · {blocked} blocked · {unread} unread")
+                    (
+                        format!(" {agents} agents · {working_n} working · {blocked} blocked · {unread} unread"),
+                        Style::default().fg(mute(theme.working)),
+                    )
                 };
-                let footer_rect = ratatui::layout::Rect::new(area.x, footer_y, area.width - btn_w, 1);
+                let summary_rect = ratatui::layout::Rect::new(area.x, summary_y, area.width, 1);
                 f.render_widget(
                     Paragraph::new(bottom).style(footer_style),
-                    footer_rect,
+                    summary_rect,
                 );
+
+                // Line 2: Actions ([+ New] on left, [⚙ Settings] on right).
+                // ASCII only: the click rect is sized by char count.
+                let new_text = " [+ New] ";
+                let new_w = (new_text.chars().count() as u16).min(area.width / 2);
+                new_btn = ratatui::layout::Rect::new(area.x, buttons_y, new_w, 1);
                 f.render_widget(
-                    Paragraph::new(btn_text).style(Style::default().fg(theme.idle_fresh).add_modifier(Modifier::BOLD)),
+                    Paragraph::new(new_text).style(Style::default().fg(mute(theme.accent))),
+                    new_btn,
+                );
+
+                let btn_text = " [⚙ Settings] ";
+                let btn_w = (btn_text.chars().count() as u16).min(area.width.saturating_sub(new_w));
+                settings_btn = ratatui::layout::Rect::new(area.right().saturating_sub(btn_w), buttons_y, btn_w, 1);
+                f.render_widget(
+                    Paragraph::new(btn_text).style(Style::default().fg(mute(theme.accent))),
                     settings_btn,
                 );
 
@@ -2209,7 +2280,7 @@ pub fn run() -> io::Result<()> {
                     let card_w = area.width.saturating_sub(2).clamp(24, 58).min(area.width);
                     let card_h = area.height.saturating_sub(4).clamp(12, 28).min(content_h);
                     let card_x = area.right().saturating_sub(card_w);
-                    let card_y = footer_y.saturating_sub(card_h).max(area.y);
+                    let card_y = buttons_y.saturating_sub(card_h).max(area.y);
                     let card_rect = ratatui::layout::Rect::new(card_x, card_y, card_w, card_h);
                     f.render_widget(ratatui::widgets::Clear, card_rect);
                     let vals = crate::settings::values(&settings_obj);
@@ -2685,14 +2756,7 @@ pub fn run() -> io::Result<()> {
                     }
                     KeyCode::Char('N') => {
                         let Some(session) = &session else { continue };
-                        let created = session
-                            .call("workspace.create", serde_json::json!({}))
-                            .is_ok();
-                        if created {
-                            status_line = "workspace created".into();
-                        } else {
-                            status_line = "workspace create failed".into();
-                        }
+                        status_line = create_workspace(session, &projects);
                         sync.invalidate();
                     }
                     _ => {}
@@ -2745,6 +2809,13 @@ pub fn run() -> io::Result<()> {
                             && m.row >= r.y
                             && m.row < r.y + r.height
                     };
+                    if contains(new_btn) {
+                        if let Some(session) = &session {
+                            status_line = create_workspace(session, &projects);
+                            sync.invalidate();
+                        }
+                        continue;
+                    }
                     if contains(settings_btn) {
                         status_line.clear();
                         settings_dialog = true;
@@ -2768,7 +2839,15 @@ pub fn run() -> io::Result<()> {
                         if let Some(idx) = visual_hit(&visual_rows, m.row)
                             .and_then(|idx| release_target(&projects, &rows, (kind, &id), idx))
                         {
-                            if matches!(rows[idx], Row::Project(_) | Row::Worktree(_, _)) {
+                            let is_fold = match rows[idx] {
+                                Row::Project(_) => true,
+                                Row::Worktree(pi, wi) => projects
+                                    .get(pi)
+                                    .and_then(|p| p.worktrees.get(wi))
+                                    .is_some_and(|w| is_worktree_fold_hit(w, m.column)),
+                                Row::Agent(_, _, _) => false,
+                            };
+                            if is_fold {
                                 fold_at(&mut projects, &mut mem, &rows, idx, None, &state_path);
                             } else if sync_error.is_none() && session.is_some() {
                                 pending_activation =
@@ -2840,6 +2919,23 @@ pub fn run() -> io::Result<()> {
     }
 }
 
+/// Native "new": Herdr applies its own cwd policy from the current space, and
+/// focus lands in the new workspace's terminal instead of leaving it unseen.
+fn create_workspace(session: &crate::ipc::Session, projects: &[Project]) -> String {
+    let source = projects
+        .iter()
+        .flat_map(|p| &p.worktrees)
+        .find(|w| w.focused)
+        .map(|w| w.workspace_id.as_str());
+    match session.call(
+        "workspace.create",
+        serde_json::json!({ "focus": true, "source_workspace_id": source }),
+    ) {
+        Ok(_) => "workspace created".into(),
+        Err(error) => format!("workspace create failed: {error}"),
+    }
+}
+
 fn focus_workspace(session: &crate::ipc::Session, workspace_id: &str) -> io::Result<()> {
     session
         .call(
@@ -2847,6 +2943,18 @@ fn focus_workspace(session: &crate::ipc::Session, workspace_id: &str) -> io::Res
             serde_json::json!({ "workspace_id": workspace_id }),
         )
         .map(|_| ())
+}
+
+fn is_worktree_fold_hit(w: &Worktree, col: u16) -> bool {
+    if w.agents.is_empty() {
+        return false;
+    }
+    let lead_width = if w.depth <= 1 {
+        4
+    } else {
+        2 * w.depth + 5
+    };
+    col <= (lead_width + 1) as u16
 }
 
 // None toggles; keyboard left/right request an explicit state.
@@ -2877,6 +2985,9 @@ fn fold_at(
             sync_collapse(projects, mem, path);
         }
         Row::Worktree(pi, wi) => {
+            if projects[pi].worktrees[wi].agents.is_empty() {
+                return;
+            }
             let collapsed = collapsed.unwrap_or(!projects[pi].worktrees[wi].collapsed);
             if projects[pi].worktrees[wi].collapsed == collapsed {
                 return;
@@ -3053,8 +3164,8 @@ fn signature(input: &SigInput, sig: &mut String) {
     sig.clear();
     write!(
         sig,
-        "{selected}:{offset}:{height}:{hover:?}:{step}:{query}:{compact}:{}:{status}:{filtering}:{font_dialog}:{font}:{:?}:{:?}:{:?}:{:?}:{settings_dialog}:{settings_row}:{settings_obj:?}:",
-        view as u8, theme.working, theme.blocked, theme.done, theme.idle,
+        "{selected}:{offset}:{height}:{hover:?}:{step}:{query}:{compact}:{}:{status}:{filtering}:{font_dialog}:{font}:{:?}:{:?}:{:?}:{:?}:{:?}:{settings_dialog}:{settings_row}:{settings_obj:?}:",
+        view as u8, theme.working, theme.blocked, theme.done, theme.idle, theme.accent,
     ).unwrap();
     for (i, row) in rows.iter().enumerate() {
         match *row {
@@ -3069,7 +3180,16 @@ fn signature(input: &SigInput, sig: &mut String) {
             }
             Row::Worktree(pi, wi) => {
                 let w = &projects[pi].worktrees[wi];
-                write!(sig, "{i}:W:{}:{}:{};", w.name, w.branch, w.collapsed).unwrap();
+                write!(
+                    sig,
+                    "{i}:W:{}:{}:{}:{}:{};",
+                    w.name,
+                    w.branch,
+                    w.collapsed,
+                    w.agents.is_empty(),
+                    w.focused
+                )
+                .unwrap();
             }
             Row::Agent(pi, wi, ai) => {
                 let a = &projects[pi].worktrees[wi].agents[ai];
@@ -3176,6 +3296,147 @@ mod tests {
         );
         let other = row_index(&projects, &rows, (0, "stub-b")).unwrap();
         assert!(release_target(&projects, &rows, (0, "stub-a"), other).is_none());
+    }
+
+    #[test]
+    fn worktree_click_activates_workspace_and_fold_arrow_folds() {
+        let mut projects = stub();
+        projects[0].worktrees[0].workspace_id = "w1".into();
+        // Add an empty worktree like exp-amazon-catalog-jev
+        projects[0].worktrees.push(Worktree {
+            key: "stub-a/exp".into(),
+            name: "exp-amazon-catalog-jev".into(),
+            branch: "exp".into(),
+            path: "/projects/exp".into(),
+            repo_root: String::new(),
+            collapsed: false,
+            depth: 1,
+            workspace_id: "w2D".into(),
+            focused: false,
+            agents: vec![],
+        });
+
+        let rows = visible(&projects, "", false, View::Grouped);
+        let main_idx = row_index(&projects, &rows, (1, "stub-a/main")).unwrap();
+        let exp_idx = row_index(&projects, &rows, (1, "stub-a/exp")).unwrap();
+
+        assert_eq!(
+            activation_target(&projects, &rows, main_idx),
+            Some(Activation::Space("w1".into()))
+        );
+        assert_eq!(
+            activation_target(&projects, &rows, exp_idx),
+            Some(Activation::Space("w2D".into()))
+        );
+
+        let w_main = &projects[0].worktrees[0];
+        let w_exp = &projects[0].worktrees[1];
+
+        // 1. Fold hit checks: main has agents, depth 0
+        assert!(is_worktree_fold_hit(w_main, 0));
+        assert!(is_worktree_fold_hit(w_main, 4));
+        assert!(is_worktree_fold_hit(w_main, 5));
+        assert!(!is_worktree_fold_hit(w_main, 6)); // name start
+        assert!(!is_worktree_fold_hit(w_main, 10));
+
+        // 2. Fold hit checks: exp has NO agents, depth 1 -> never fold
+        assert!(!is_worktree_fold_hit(w_exp, 0));
+        assert!(!is_worktree_fold_hit(w_exp, 4));
+        assert!(!is_worktree_fold_hit(w_exp, 10));
+
+        // 3. Simulating Mouse Up on empty worktree (exp-amazon-catalog-jev):
+        // Any column release must set PendingActivation to open workspace w2D
+        for col in [0, 4, 10, 20] {
+            let clicked = release_target(&projects, &rows, (1, "stub-a/exp"), exp_idx).unwrap();
+            let is_fold = match rows[clicked] {
+                Row::Worktree(pi, wi) => is_worktree_fold_hit(&projects[pi].worktrees[wi], col),
+                _ => true,
+            };
+            assert!(!is_fold, "empty worktree click must never fold at col {col}");
+            let pending = PendingActivation::new(&projects, &rows, clicked, false).unwrap();
+            assert_eq!(
+                pending.resolve(&projects, &rows).map(|(_, t)| t),
+                Some(Activation::Space("w2D".into())),
+                "empty worktree click must activate workspace w2D"
+            );
+        }
+
+        // 4. Simulating Mouse Up on worktree with agents (main):
+        // Name click (col 10) sets PendingActivation to open workspace w1
+        let clicked = release_target(&projects, &rows, (1, "stub-a/main"), main_idx).unwrap();
+        let is_fold = match rows[clicked] {
+            Row::Worktree(pi, wi) => is_worktree_fold_hit(&projects[pi].worktrees[wi], 10),
+            _ => true,
+        };
+        assert!(!is_fold);
+        let pending = PendingActivation::new(&projects, &rows, clicked, false).unwrap();
+        assert_eq!(
+            pending.resolve(&projects, &rows).map(|(_, t)| t),
+            Some(Activation::Space("w1".into()))
+        );
+
+        // Arrow click (col 4) folds agents instead
+        let is_fold = match rows[clicked] {
+            Row::Worktree(pi, wi) => is_worktree_fold_hit(&projects[pi].worktrees[wi], 4),
+            _ => false,
+        };
+        assert!(is_fold);
+
+        // 5. Signature invalidation when agents transition between empty and non-empty
+        let theme = load_theme();
+        let settings = crate::config::Settings::default();
+        let mut sig_before = String::new();
+        signature(
+            &SigInput {
+                projects: &projects,
+                rows: &rows,
+                selected: 0,
+                offset: 0,
+                height: 20,
+                hover: None,
+                step: 0,
+                query: "",
+                compact: false,
+                view: View::Grouped,
+                status: "",
+                filtering: false,
+                theme: &theme,
+                font_dialog: false,
+                font: false,
+                settings_dialog: false,
+                settings_row: 0,
+                settings_obj: &settings,
+            },
+            &mut sig_before,
+        );
+        // Clear agents on main
+        projects[0].worktrees[0].agents.clear();
+        let rows_after = visible(&projects, "", false, View::Grouped);
+        let mut sig_after = String::new();
+        signature(
+            &SigInput {
+                projects: &projects,
+                rows: &rows_after,
+                selected: 0,
+                offset: 0,
+                height: 20,
+                hover: None,
+                step: 0,
+                query: "",
+                compact: false,
+                view: View::Grouped,
+                status: "",
+                filtering: false,
+                theme: &theme,
+                font_dialog: false,
+                font: false,
+                settings_dialog: false,
+                settings_row: 0,
+                settings_obj: &settings,
+            },
+            &mut sig_after,
+        );
+        assert_ne!(sig_before, sig_after, "signature must invalidate when worktree agents become empty");
     }
 
     #[test]
@@ -3439,6 +3700,23 @@ mod tests {
     }
 
     #[test]
+    fn mute_keeps_hue_but_is_quieter() {
+        let spread = |c: Color| match c {
+            Color::Rgb(r, g, b) => (r.max(g).max(b), r.max(g).max(b) - r.min(g).min(b)),
+            _ => unreachable!(),
+        };
+        for raw in [Color::Rgb(0xf9, 0xe2, 0xaf), Color::Rgb(0xcb, 0xa6, 0xf7)] {
+            let (bright, sat) = spread(raw);
+            let (m_bright, m_sat) = spread(mute(raw));
+            assert!(m_bright < bright && m_sat < sat, "{raw:?} -> {:?}", mute(raw));
+        }
+        // Channel order (the hue) survives: mauve stays blue > red > green.
+        let Color::Rgb(r, g, b) = mute(Color::Rgb(0xcb, 0xa6, 0xf7)) else { unreachable!() };
+        assert!(b > r && r > g);
+        assert_eq!(mute(Color::Cyan), Color::Cyan);
+    }
+
+    #[test]
     fn theme_parses_row_rules_and_custom() {
         let text = "[theme.custom]\nyellow = \"#111111\"\n[ui.sidebar.agents]\nrows = [[{ token = \"x\", rules = [{ equals = \"working\", fg = \"#222222\" }] }]]";
         assert_eq!(
@@ -3650,6 +3928,13 @@ mod tests {
             seat_row(&projects, &rows, Some(pid)),
             rows.iter().position(|r| matches!(*r, Row::Agent(1, 0, 0)))
         );
+        // A focused worktree wins over the project header when no agent is focused.
+        projects[1].worktrees[0].agents[0].focused = false;
+        projects[1].worktrees[0].focused = true;
+        let rows = visible(&projects, "", false, View::Grouped);
+        let want_wt = rows.iter().position(|r| matches!(*r, Row::Worktree(1, 0)));
+        assert!(want_wt.is_some());
+        assert_eq!(seat_row(&projects, &rows, None), want_wt);
     }
 
     #[test]
