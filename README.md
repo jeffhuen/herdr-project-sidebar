@@ -8,12 +8,12 @@ These are separate presentation implementations, not interchangeable skins.
 Both use Herdr's agent and workspace state. The dock uses native APIs for
 navigation and pane placement; native-sidebar styling does not control it.
 
-## Install v0.2.2
+## Install v0.2.3
 
 Requires Herdr 0.9.1+, Rust 1.89+, Git, and Linux or macOS.
 
 ```sh
-herdr plugin install jeffhuen/herdr-project-sidebar --ref v0.2.2
+herdr plugin install jeffhuen/herdr-project-sidebar --ref v0.2.3
 herdr plugin action invoke configure --plugin herdr-project-sidebar
 ```
 
@@ -24,7 +24,7 @@ This release was verified on Linux; macOS runtime behavior was not checked.
 ## Build and link a checkout
 
 ```sh
-git clone --branch v0.2.2 --depth 1 https://github.com/jeffhuen/herdr-project-sidebar.git
+git clone --branch v0.2.3 --depth 1 https://github.com/jeffhuen/herdr-project-sidebar.git
 cd herdr-project-sidebar
 cargo build --release --locked
 cargo test --release --locked
