@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-09-26
+
+### Fixed
+
+- The dock and native sidebar now order sessions by visual tab position. Moving
+  tabs in the tab bar updates the session order under each worktree. Previously,
+  the dock sorted sessions by immutable tab IDs, which ignored tab moves. Both
+  renderers now read the snapshot tab array index rather than the creation
+  number.
+
 ## [0.2.2] - 2026-09-23
 
 Internal cleanup for maintainability. Smaller modules and shared helpers replace
@@ -168,7 +178,8 @@ First tagged release. Earlier development builds were available from `main`.
 - Herdr 0.9.1 can override a mouse activation with a late pane-focus operation.
   Keyboard Enter avoids this race. See [Herdr #4390](https://github.com/herdrdev/herdr/issues/4390).
 
-[Unreleased]: https://github.com/jeffhuen/herdr-project-sidebar/compare/v0.2.2...main
+[Unreleased]: https://github.com/jeffhuen/herdr-project-sidebar/compare/v0.2.3...main
+[0.2.3]: https://github.com/jeffhuen/herdr-project-sidebar/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/jeffhuen/herdr-project-sidebar/releases/tag/v0.2.2
 [0.2.1]: https://github.com/jeffhuen/herdr-project-sidebar/releases/tag/v0.2.1
 [0.2.0]: https://github.com/jeffhuen/herdr-project-sidebar/releases/tag/v0.2.0

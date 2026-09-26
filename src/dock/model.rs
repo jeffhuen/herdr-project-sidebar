@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::time::Duration;
 
@@ -464,6 +464,26 @@ pub(super) fn snapshot(
             .or_default()
             .insert(directory);
     }
+    let tab_order: HashMap<&str, usize> = snap["tabs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(idx, tab)| {
+            let id = tab.get("tab_id")?.as_str()?;
+            Some((id, idx))
+        })
+        .collect();
+    let pane_order: HashMap<&str, usize> = snap["panes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(idx, pane)| {
+            let id = pane.get("pane_id")?.as_str()?;
+            Some((id, idx))
+        })
+        .collect();
     fn repo_of(ws_by_id: &BTreeMap<&str, &WorkspaceEntry>, ws_id: &str) -> Option<String> {
         ws_by_id
             .get(ws_id)
@@ -637,7 +657,14 @@ pub(super) fn snapshot(
                     }
                 })
                 .collect();
-            list.sort_by_key(|a| (a.tab_id.clone(), a.pane_id.clone()));
+            list.sort_by(|a, b| {
+                let to_a = tab_order.get(a.tab_id.as_str()).copied().unwrap_or(usize::MAX);
+                let to_b = tab_order.get(b.tab_id.as_str()).copied().unwrap_or(usize::MAX);
+                let po_a = pane_order.get(a.pane_id.as_str()).copied().unwrap_or(usize::MAX);
+                let po_b = pane_order.get(b.pane_id.as_str()).copied().unwrap_or(usize::MAX);
+                (to_a, a.tab_id.as_str(), po_a, a.pane_id.as_str())
+                    .cmp(&(to_b, b.tab_id.as_str(), po_b, b.pane_id.as_str()))
+            });
             let linked =
                 wt.is_some_and(|t| t.is_linked_worktree) || mem.linked_checkouts.contains(&probe);
             let checkout_name = std::path::Path::new(&probe)
@@ -1019,6 +1046,49 @@ mod tests {
             .remove("terminal_id");
         assert!(snapshot(&malformed, &mem, &[Color::Cyan], false, 2_000).is_err());
         assert_eq!(mem.freshness("alpha", 2_000), State::IdleFresh);
+    }
+
+    #[test]
+    fn tab_and_pane_order_determines_session_sequence() {
+        let mut snap = serde_json::json!({
+            "workspaces": [{"workspace_id": "w1", "label": "test"}],
+            "tabs": [
+                {"tab_id": "tab-z", "number": 16},
+                {"tab_id": "tab-a", "number": 23}
+            ],
+            "panes": [
+                {"pane_id": "pane-z2", "workspace_id": "w1"},
+                {"pane_id": "pane-z1", "workspace_id": "w1"},
+                {"pane_id": "pane-a1", "workspace_id": "w1"}
+            ],
+            "agents": [
+                {"terminal_id": "t-a1", "pane_id": "pane-a1", "tab_id": "tab-a", "workspace_id": "w1"},
+                {"terminal_id": "t-z1", "pane_id": "pane-z1", "tab_id": "tab-z", "workspace_id": "w1"},
+                {"terminal_id": "t-z2", "pane_id": "pane-z2", "tab_id": "tab-z", "workspace_id": "w1"}
+            ]
+        });
+        let mem = Memory::default();
+        let projects = snapshot(&snap, &mem, &[Color::Cyan], false, 0).unwrap();
+        let term_ids: Vec<&str> = projects[0].worktrees[0]
+            .agents
+            .iter()
+            .map(|a| a.terminal_id.as_str())
+            .collect();
+        assert_eq!(term_ids, vec!["t-z2", "t-z1", "t-a1"]);
+
+        // Reorder tabs: tab-a (number 23) placed at index 0, tab-z (number 16) at index 1.
+        // The array position (visual tab bar slot) must take precedence over the immutable tab number.
+        snap["tabs"] = serde_json::json!([
+            {"tab_id": "tab-a", "number": 23},
+            {"tab_id": "tab-z", "number": 16}
+        ]);
+        let projects = snapshot(&snap, &mem, &[Color::Cyan], false, 0).unwrap();
+        let term_ids: Vec<&str> = projects[0].worktrees[0]
+            .agents
+            .iter()
+            .map(|a| a.terminal_id.as_str())
+            .collect();
+        assert_eq!(term_ids, vec!["t-a1", "t-z2", "t-z1"]);
     }
 
     #[test]

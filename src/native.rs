@@ -918,12 +918,7 @@ pub fn rows(input: &RowsInput) -> (RowTokens, RowTokens) {
     let tab_order: HashMap<_, _> = tabs
         .iter()
         .enumerate()
-        .map(|(index, tab)| {
-            (
-                text(tab, "tab_id"),
-                tab["number"].as_u64().unwrap_or(index as u64),
-            )
-        })
+        .map(|(index, tab)| (text(tab, "tab_id"), index))
         .collect();
     let pane_order: HashMap<_, _> = panes
         .iter()
@@ -955,7 +950,7 @@ pub fn rows(input: &RowsInput) -> (RowTokens, RowTokens) {
             tab_order
                 .get(text(a, "tab_id"))
                 .copied()
-                .unwrap_or(u64::MAX),
+                .unwrap_or(usize::MAX),
             pane_order
                 .get(text(a, "pane_id"))
                 .copied()
@@ -971,7 +966,7 @@ pub fn rows(input: &RowsInput) -> (RowTokens, RowTokens) {
                 tab_order
                     .get(text(b, "tab_id"))
                     .copied()
-                    .unwrap_or(u64::MAX),
+                    .unwrap_or(usize::MAX),
                 pane_order
                     .get(text(b, "pane_id"))
                     .copied()
