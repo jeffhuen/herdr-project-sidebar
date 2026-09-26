@@ -230,6 +230,12 @@ impl Menus {
                     return self.cancel_dialog();
                 }
             }
+            Event::Paste(text) => {
+                if let Some(input) = dialog.input_mut() {
+                    input.extend(text.chars().filter(|c| !c.is_control()));
+                    self.revision = self.revision.wrapping_add(1);
+                }
+            }
             _ => {}
         }
         None

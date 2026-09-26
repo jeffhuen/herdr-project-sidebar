@@ -61,6 +61,17 @@ pub(super) struct Agent {
     pub(super) focused: bool,
 }
 
+impl Agent {
+    /// Plain terminals have no agent state, so they never outrank an agent.
+    fn rank(&self) -> u8 {
+        if self.vendor == "terminal" {
+            9
+        } else {
+            self.state.rank()
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct Worktree {
     pub(super) key: String,
@@ -781,8 +792,8 @@ pub(super) fn snapshot(
             }
         }
         worktrees.sort_by(|a, b| {
-            let ra = a.agents.iter().map(|x| x.state.rank()).min().unwrap_or(9);
-            let rb = b.agents.iter().map(|x| x.state.rank()).min().unwrap_or(9);
+            let ra = a.agents.iter().map(Agent::rank).min().unwrap_or(9);
+            let rb = b.agents.iter().map(Agent::rank).min().unwrap_or(9);
             ra.cmp(&rb).then_with(|| a.name.cmp(&b.name))
         });
         let branch = worktrees
@@ -843,7 +854,7 @@ pub(super) fn snapshot(
             p.worktrees
                 .iter()
                 .flat_map(|w| &w.agents)
-                .map(|x| x.state.rank())
+                .map(Agent::rank)
                 .min()
                 .unwrap_or(9)
         };
@@ -900,7 +911,7 @@ pub(super) fn visible(projects: &[Project], query: &str, compact: bool, view: Vi
         }
         flat.sort_by_key(|&(pi, wi, ai)| {
             let a = &projects[pi].worktrees[wi].agents[ai];
-            (a.state.rank(), std::cmp::Reverse(a.seq))
+            (a.rank(), std::cmp::Reverse(a.seq))
         });
         return flat.into_iter().map(|(pi, wi, ai)| Row::Agent(pi, wi, ai)).collect();
     }
@@ -1213,6 +1224,33 @@ mod tests {
         assert!(folded.len() < full);
         assert!(matches!(folded[0], Row::Project(0)));
         assert!(matches!(folded[1], Row::Project(1)));
+    }
+
+    #[test]
+    fn terminal_only_worktree_does_not_outrank_agent_worktree() {
+        let snap = serde_json::json!({
+            "workspaces": [
+                {"workspace_id": "w1", "worktree": {"repo_key": "/repo/.git", "repo_name": "repo",
+                    "checkout_path": "/repo", "is_linked_worktree": false}},
+                {"workspace_id": "w2", "worktree": {"repo_key": "/repo/.git", "repo_name": "repo",
+                    "checkout_path": "/wt/aaa", "is_linked_worktree": true}}
+            ],
+            "tabs": [{"tab_id": "w1:t1"}, {"tab_id": "w2:t1"}],
+            "panes": [
+                {"pane_id": "w1:p1", "terminal_id": "t-agent", "tab_id": "w1:t1", "workspace_id": "w1", "cwd": "/repo"},
+                {"pane_id": "w2:p1", "terminal_id": "t-shell", "tab_id": "w2:t1", "workspace_id": "w2", "cwd": "/wt/aaa"}
+            ],
+            "agents": [
+                {"terminal_id": "t-agent", "pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1",
+                    "agent": "omp", "agent_status": "idle", "cwd": "/repo"}
+            ]
+        });
+        let mut mem = Memory::default();
+        mem.branches.insert("/repo".into(), "main".into());
+        mem.branches.insert("/wt/aaa".into(), "aaa".into());
+        let projects = snapshot(&snap, &mem, &[Color::Cyan], false, 0).unwrap();
+        let names: Vec<&str> = projects[0].worktrees.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(names, vec!["main", "aaa"]);
     }
 
     #[test]

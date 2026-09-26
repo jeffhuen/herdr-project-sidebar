@@ -388,6 +388,12 @@ impl Dock {
                 }
                 _ => {}
             },
+            // One paste event: pasted text fills the filter, never fires hotkeys.
+            Event::Paste(text) if self.filtering => {
+                self.query.extend(text.chars().filter(|c| !c.is_control()));
+                self.selected = 0;
+                self.offset = 0;
+            }
             _ => {}
         }
         Continue(())

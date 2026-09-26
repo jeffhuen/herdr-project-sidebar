@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Worktrees and projects that hold only plain terminals no longer sort above
+  ones with agents. In 0.2.3, a linked worktree with one terminal could appear
+  above `main`.
+- Pasting into the dock no longer triggers its shortcuts. A paste into the
+  filter or a dialog adds the text; any other paste is ignored. Before, a pasted
+  path that began with `/` opened the filter and hid every row.
+
 ## [0.2.3] - 2026-09-26
 
 ### Added

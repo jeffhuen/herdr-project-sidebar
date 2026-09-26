@@ -16,7 +16,8 @@ use crate::activity::ActivityStore;
 #[cfg(test)]
 use crate::activity::now_unix_ms;
 use crossterm::event::{
-    self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -144,7 +145,7 @@ impl Dock {
 /// Idempotent restoration for normal exit, errors, and panics.
 fn restore_term() {
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, DisableFocusChange);
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, DisableFocusChange, DisableBracketedPaste);
 }
 
 struct TermGuard;
@@ -178,6 +179,7 @@ pub fn run() -> io::Result<()> {
         EnterAlternateScreen,
         EnableMouseCapture,
         EnableFocusChange,
+        EnableBracketedPaste,
         SetTitle(PANE_TITLE)
     )?;
     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
@@ -385,7 +387,8 @@ pub fn run() -> io::Result<()> {
         term.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture,
-        DisableFocusChange
+        DisableFocusChange,
+        DisableBracketedPaste
     )?;
     match dock.session {
         Some(session) => crate::native::dock_command(crate::dock_control::Command::Close, &session),
