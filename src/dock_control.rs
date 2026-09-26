@@ -338,8 +338,8 @@ impl Controller {
         let dock_edge = horizontal_edge(pane_rect(&live_layout, &pane.id)?, settings.dock_right)?;
         let wanted_edge = horizontal_edge(pane_rect(&live_layout, &edge)?, settings.dock_right)?;
         if wanted_edge > dock_edge + 1.0 {
-            // Swap always focuses its source, even for background tabs. Restore the
-            // actual previous focus, not the content pane we happened to split.
+            // Swap focuses its source. With the edge content pane as source, the
+            // usual single-pane tab keeps focus and needs no restoring pane.focus.
             let latest = current(session)?;
             if latest.terminal != before.terminal {
                 return Ok(());
@@ -347,15 +347,14 @@ impl Controller {
             let swapped = session.call(
                 "pane.swap",
                 json!({
-                    "source_pane_id": pane.id, "target_pane_id": edge
+                    "source_pane_id": edge, "target_pane_id": pane.id
                 }),
             );
             let restore = (|| {
-                if focus {
+                if focus || before.id == edge {
                     return Ok(());
                 }
-                let after = current(session)?;
-                if after.terminal == pane.terminal && before.terminal != pane.terminal {
+                if current(session)?.id == edge {
                     session.call("pane.focus", json!({"pane_id": before.id}))?;
                 }
                 Ok::<(), io::Error>(())

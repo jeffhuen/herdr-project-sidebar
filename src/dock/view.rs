@@ -81,6 +81,7 @@ impl Dock {
                     let v_color = vendor_color(&a.vendor);
                     let icon_mode = self.settings_obj.icons;
                     let label = match crate::icons::logo(&a.vendor, icon_mode) {
+                        Some(logo) if a.label.is_empty() => logo.to_string(),
                         Some(logo) => format!("{logo} {}", a.label),
                         None => a.label.clone(),
                     };
@@ -112,7 +113,7 @@ impl Dock {
                         ),
                         Span::raw(" "),
                         Span::styled(label, Style::default().fg(v_color)),
-                        Span::raw(if self.settings_obj.show_title { " · " } else { "" }),
+                        Span::raw(if self.settings_obj.show_title && !a.title.is_empty() { " · " } else { "" }),
                         Span::styled(
                             if self.settings_obj.show_title {
                                 a.title.as_str()

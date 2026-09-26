@@ -388,7 +388,7 @@ fn agent_title(e: &AgentEntry) -> String {
         }
     }
 
-    if !name.is_empty() && name != "?" {
+    if !name.is_empty() && name != "?" && name != "terminal" {
         return name.to_string();
     }
 
@@ -441,14 +441,37 @@ pub(super) fn snapshot(
             "snapshot has missing or duplicate agent identity or workspace".into(),
         ));
     }
-    drop(terminals);
+    let existing_pane_ids: HashSet<&str> = agents.iter().map(|a| a.pane_id.as_str()).collect();
     let ws_by_id: BTreeMap<&str, &WorkspaceEntry> = workspaces
         .iter()
         .map(|w| (w.workspace_id.as_str(), w))
         .collect();
     let mut workspace_directories: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    let mut extra_terminals = Vec::new();
+    fn is_plugin_pane(pane: &serde_json::Value) -> bool {
+        if pane.pointer("/tokens/hps_dock").and_then(|v| v.as_str()) == Some("projects") {
+            return true;
+        }
+        if let Some(tokens) = pane.get("tokens").and_then(|t| t.as_object()) {
+            if tokens.keys().any(|k| {
+                k.starts_with("herdr-")
+                    || k.starts_with("hps_")
+                    || k.contains("dock")
+                    || k.contains("sidebar")
+                    || k.contains("plugin")
+            }) {
+                return true;
+            }
+        }
+        if pane.get("label").and_then(|l| l.as_str()).is_some_and(|l| !l.is_empty())
+            && pane.get("agent").and_then(|a| a.as_str()).is_none_or(|a| a.is_empty())
+        {
+            return true;
+        }
+        false
+    }
     for pane in snap["panes"].as_array().into_iter().flatten() {
-        if pane["tokens"]["hps_dock"].as_str() == Some("projects") {
+        if is_plugin_pane(pane) {
             continue;
         }
         let Some(workspace) = pane["workspace_id"].as_str() else {
@@ -463,7 +486,44 @@ pub(super) fn snapshot(
             .entry(workspace)
             .or_default()
             .insert(directory);
+
+        let Some(pane_id) = pane["pane_id"].as_str().filter(|id| !id.trim().is_empty()) else {
+            continue;
+        };
+        let Some(terminal_id) = pane["terminal_id"].as_str().filter(|id| !id.trim().is_empty()) else {
+            continue;
+        };
+        if !workspaces.iter().any(|w| w.workspace_id == workspace) {
+            continue;
+        }
+        if existing_pane_ids.contains(pane_id) || !terminals.insert(terminal_id) {
+            continue;
+        }
+        let cwd = pane["cwd"].as_str().unwrap_or("").to_owned();
+        let foreground_cwd = pane["foreground_cwd"].as_str().filter(|s| !s.is_empty()).map(String::from);
+        let tab_id = pane["tab_id"].as_str().unwrap_or("").to_owned();
+        let focused = pane["focused"].as_bool().unwrap_or(false);
+        let terminal_title = pane["terminal_title"].as_str().map(String::from);
+        let terminal_title_stripped = pane["terminal_title_stripped"].as_str().map(String::from);
+        extra_terminals.push(AgentEntry {
+            terminal_id: terminal_id.to_owned(),
+            agent: "terminal".to_owned(),
+            title: None,
+            display_agent: Some("terminal".to_owned()),
+            agent_status: "idle".to_owned(),
+            pane_id: pane_id.to_owned(),
+            tab_id,
+            workspace_id: workspace.to_owned(),
+            cwd,
+            foreground_cwd,
+            agent_session: None,
+            focused,
+            state_change_seq: 0,
+            terminal_title_stripped,
+            terminal_title,
+        });
     }
+    agents.extend(extra_terminals);
     let tab_order: HashMap<&str, usize> = snap["tabs"]
         .as_array()
         .into_iter()
@@ -631,14 +691,18 @@ pub(super) fn snapshot(
                     if st == State::Idle {
                         st = mem.freshness(&e.terminal_id, now_ms);
                     }
+                    let is_terminal = e.agent == "terminal";
                     let vendor = if e.agent.is_empty() { "?" } else { &e.agent };
                     Agent {
                         vendor: vendor.to_owned(),
-                        label: e
-                            .display_agent
-                            .clone()
-                            .filter(|l| !l.is_empty())
-                            .unwrap_or_else(|| vendor.to_owned()),
+                        label: if is_terminal {
+                            String::new()
+                        } else {
+                            e.display_agent
+                                .clone()
+                                .filter(|l| !l.is_empty())
+                                .unwrap_or_else(|| vendor.to_owned())
+                        },
                         title: agent_title(e),
                         state: st,
                         terminal_id: e.terminal_id.clone(),
@@ -942,6 +1006,9 @@ pub(super) fn counts(projects: &[Project]) -> (usize, usize, usize, usize) {
     for p in projects {
         for w in &p.worktrees {
             for a in &w.agents {
+                if a.vendor == "terminal" {
+                    continue;
+                }
                 agents += 1;
                 match a.state {
                     State::Working | State::Monitoring => working += 1,
@@ -1089,6 +1156,52 @@ mod tests {
             .map(|a| a.terminal_id.as_str())
             .collect();
         assert_eq!(term_ids, vec!["t-a1", "t-z2", "t-z1"]);
+    }
+
+    #[test]
+    fn terminals_included_in_tab_order() {
+        let mut snap = serde_json::json!({
+            "workspaces": [{"workspace_id": "w1", "label": "test"}],
+            "tabs": [
+                {"tab_id": "tab-1", "number": 1},
+                {"tab_id": "tab-2", "number": 2},
+                {"tab_id": "tab-3", "number": 3}
+            ],
+            "panes": [
+                {"pane_id": "p-agent", "terminal_id": "t-agent", "tab_id": "tab-1", "workspace_id": "w1"},
+                {"pane_id": "p-shell", "terminal_id": "t-shell", "tab_id": "tab-2", "workspace_id": "w1", "terminal_title": "zsh"},
+                {"pane_id": "p-agent2", "terminal_id": "t-agent2", "tab_id": "tab-3", "workspace_id": "w1"}
+            ],
+            "agents": [
+                {"terminal_id": "t-agent", "pane_id": "p-agent", "tab_id": "tab-1", "workspace_id": "w1", "agent": "omp"},
+                {"terminal_id": "t-agent2", "pane_id": "p-agent2", "tab_id": "tab-3", "workspace_id": "w1", "agent": "claude"}
+            ]
+        });
+        let mem = Memory::default();
+        let projects = snapshot(&snap, &mem, &[Color::Cyan], false, 0).unwrap();
+        let agents = &projects[0].worktrees[0].agents;
+        assert_eq!(agents.len(), 3);
+        assert_eq!(agents[0].terminal_id, "t-agent");
+        assert_eq!(agents[0].vendor, "omp");
+        assert_eq!(agents[1].terminal_id, "t-shell");
+        assert_eq!(agents[1].vendor, "terminal");
+        assert_eq!(agents[1].title, "zsh");
+        assert_eq!(agents[2].terminal_id, "t-agent2");
+        assert_eq!(agents[2].vendor, "claude");
+
+        let (count, _, _, _) = counts(&projects);
+        assert_eq!(count, 2);
+
+        snap["tabs"] = serde_json::json!([
+            {"tab_id": "tab-2", "number": 2},
+            {"tab_id": "tab-1", "number": 1},
+            {"tab_id": "tab-3", "number": 3}
+        ]);
+        let projects = snapshot(&snap, &mem, &[Color::Cyan], false, 0).unwrap();
+        let agents = &projects[0].worktrees[0].agents;
+        assert_eq!(agents[0].terminal_id, "t-shell");
+        assert_eq!(agents[1].terminal_id, "t-agent");
+        assert_eq!(agents[2].terminal_id, "t-agent2");
     }
 
     #[test]

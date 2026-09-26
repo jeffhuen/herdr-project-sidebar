@@ -4,6 +4,18 @@
 
 ## [0.2.3] - 2026-09-26
 
+### Added
+
+- The dock lists plain terminal panes next to agent sessions, in tab order, as
+  `>_ · <title>`. The footer counts agents only. Plugin panes, such as file
+  viewers and the dock itself, stay hidden.
+
+### Changed
+
+- A left dock that follows you to another tab now uses two layout changes, not
+  three. The swap no longer moves focus to the dock and back, so a single-pane
+  tab keeps its focus throughout the move.
+
 ### Fixed
 
 - The dock and native sidebar now order sessions by visual tab position. Moving

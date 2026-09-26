@@ -182,6 +182,7 @@ pub(super) fn vendor_color(vendor: &str) -> Color {
         "kilo" => Color::Rgb(0x9a, 0x98, 0x08),
         "omp" => Color::Rgb(0xcb, 0xa6, 0xf7),
         "pi" => Color::Rgb(0xfa, 0xb3, 0x87),
+        "terminal" | "sh" | "shell" => Color::Rgb(0x89, 0xb4, 0xfa),
         _ => Color::Rgb(0xc7, 0x8a, 0x1f),
     }
 }

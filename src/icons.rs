@@ -68,6 +68,7 @@ pub fn logo(agent: &str, mode: IconMode) -> Option<&'static str> {
         "devin" => ("\u{e1b5}", "ꓓ"),
         "qodercli" => ("\u{e1b6}", "Ǫ"),
         "glm" => ("\u{e1b7}", "Ƶ"),
+        "terminal" | "sh" | "shell" => (">_", ">_"),
         _ => return None,
     };
     match mode {
