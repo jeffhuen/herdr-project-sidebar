@@ -37,6 +37,9 @@ pub(super) struct Memory {
     pub(super) branches: BTreeMap<String, String>,
     pub(super) linked_checkouts: HashSet<String>,
     pub(super) branch_at: Option<std::time::Instant>,
+    /// Workspace -> terminal that last had pane focus there. Clicking the dock
+    /// focuses the dock itself, so New reads this instead of Herdr's focused pane.
+    pub(super) work_terminals: BTreeMap<String, String>,
 }
 
 impl Memory {

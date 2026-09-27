@@ -303,7 +303,7 @@ impl Dock {
                     }
                     KeyCode::Char('N') => {
                         let Some(active_session) = &self.session else { return Continue(()) };
-                        self.status_line = create_workspace(active_session, &self.projects);
+                        self.status_line = create_workspace(active_session, &self.projects, &self.mem);
                         self.sync.invalidate();
                     }
                     _ => {}
@@ -324,7 +324,7 @@ impl Dock {
                     let point = (m.column, m.row).into();
                     if self.new_btn.contains(point) {
                         if let Some(active_session) = &self.session {
-                            self.status_line = create_workspace(active_session, &self.projects);
+                            self.status_line = create_workspace(active_session, &self.projects, &self.mem);
                             self.sync.invalidate();
                         }
                         return Continue(());
@@ -407,17 +407,34 @@ fn focus_session(session: &crate::ipc::Session, pane_id: &str) -> io::Result<()>
         .map(|_| ())
 }
 
-/// Let Herdr apply its cwd policy and focus the new workspace.
-fn create_workspace(session: &crate::ipc::Session, projects: &[Project]) -> String {
+/// Match Herdr's `follow` policy as if the dock were not there: Herdr would read
+/// the focused pane, which is the dock itself once it is clicked.
+fn new_workspace_params(projects: &[Project], mem: &Memory) -> serde_json::Value {
     let source = projects
         .iter()
         .flat_map(|p| &p.worktrees)
-        .find(|w| w.focused)
-        .map(|w| w.workspace_id.as_str());
-    match session.call(
-        "workspace.create",
-        serde_json::json!({ "focus": true, "source_workspace_id": source }),
-    ) {
+        .find(|w| w.focused);
+    let cwd = source
+        .and_then(|w| {
+            let terminal = mem.work_terminals.get(&w.workspace_id);
+            projects
+                .iter()
+                .flat_map(|p| &p.worktrees)
+                .flat_map(|w| &w.agents)
+                .find(|a| Some(&a.terminal_id) == terminal && a.workspace_id == w.workspace_id)
+                .map(|a| a.cwd.as_str())
+                .or(Some(w.path.as_str()))
+        })
+        .filter(|cwd| !cwd.is_empty());
+    serde_json::json!({
+        "focus": true,
+        "source_workspace_id": source.map(|w| w.workspace_id.as_str()),
+        "cwd": cwd,
+    })
+}
+
+fn create_workspace(session: &crate::ipc::Session, projects: &[Project], mem: &Memory) -> String {
+    match session.call("workspace.create", new_workspace_params(projects, mem)) {
         Ok(_) => "workspace created".into(),
         Err(error) => format!("workspace create failed: {error}"),
     }
@@ -815,5 +832,29 @@ mod tests {
         }
         assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), modified);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn new_workspace_follows_last_working_pane_not_the_dock() {
+        let projects = super::super::snapshot(&serde_json::json!({
+            "workspaces": [
+                {"workspace_id":"w1","label":"repo","focused":true,"worktree":{
+                    "repo_key":"/repo/.git","repo_name":"repo","repo_root":"/repo","checkout_path":"/repo"}},
+                {"workspace_id":"w2","label":"other"}
+            ],
+            "agents": [
+                {"terminal_id":"t1","pane_id":"w1:p1","workspace_id":"w1","cwd":"/repo","foreground_cwd":"/repo/sub"},
+                {"terminal_id":"t2","pane_id":"w2:p1","workspace_id":"w2","cwd":"/elsewhere"}
+            ],
+            "panes": [{"pane_id":"w1:p2","terminal_id":"dock","workspace_id":"w1",
+                       "cwd":"/plugin","focused":true,"tokens":{"hps_dock":"projects"}}]
+        }), &Memory::default(), &[ratatui::style::Color::White], false, 0).unwrap();
+        let mut mem = Memory::default();
+        let cwd = |mem: &Memory| new_workspace_params(&projects, mem)["cwd"].clone();
+        assert_eq!(cwd(&mem), "/repo", "no focus history: the workspace checkout, never the dock");
+        mem.work_terminals.insert("w1".into(), "t1".into());
+        assert_eq!(cwd(&mem), "/repo/sub", "the last working pane's foreground directory");
+        mem.work_terminals.insert("w1".into(), "t2".into());
+        assert_eq!(cwd(&mem), "/repo", "a pane that moved to another workspace is not a source");
     }
 }

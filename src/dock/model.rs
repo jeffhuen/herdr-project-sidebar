@@ -355,8 +355,12 @@ pub(super) fn install_snapshot(
         if matches!(a.state, State::Working | State::Monitoring) {
             mem.activity.mark_working(&a.terminal_id, now_ms);
         }
+        if a.focused {
+            mem.work_terminals.insert(a.workspace_id.clone(), a.terminal_id.clone());
+        }
     }
     mem.activity.retain_live(&live);
+    mem.work_terminals.retain(|_, terminal| live.contains(terminal.as_str()));
     // Remove member aliases so an unfolded repo cannot regain its saved fold.
     for project in &mut projects {
         if project.id.starts_with("repo:") {

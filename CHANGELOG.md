@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-09-27
+
 ### Fixed
 
 - Worktrees and projects that hold only plain terminals no longer sort above
@@ -10,6 +12,10 @@
 - Pasting into the dock no longer triggers its shortcuts. A paste into the
   filter or a dialog adds the text; any other paste is ignored. Before, a pasted
   path that began with `/` opened the filter and hid every row.
+- **New** now opens the workspace in the directory of the pane you were last
+  working in. Clicking the dock focuses the dock itself, so Herdr's `follow`
+  policy started every new workspace in the plugin's own checkout. Herdr's
+  sidebar does not steal focus, so it never had this problem.
 
 ## [0.2.3] - 2026-09-26
 
@@ -199,7 +205,8 @@ First tagged release. Earlier development builds were available from `main`.
 - Herdr 0.9.1 can override a mouse activation with a late pane-focus operation.
   Keyboard Enter avoids this race. See [Herdr #4390](https://github.com/herdrdev/herdr/issues/4390).
 
-[Unreleased]: https://github.com/jeffhuen/herdr-project-sidebar/compare/v0.2.3...main
+[Unreleased]: https://github.com/jeffhuen/herdr-project-sidebar/compare/v0.2.4...main
+[0.2.4]: https://github.com/jeffhuen/herdr-project-sidebar/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/jeffhuen/herdr-project-sidebar/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/jeffhuen/herdr-project-sidebar/releases/tag/v0.2.2
 [0.2.1]: https://github.com/jeffhuen/herdr-project-sidebar/releases/tag/v0.2.1
